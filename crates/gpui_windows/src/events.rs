@@ -30,6 +30,7 @@ pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+pub(crate) const IDLE_RESOURCE_RELEASE_TIMER_ID: usize = 2;
 
 impl WindowsWindowInner {
     pub(crate) fn handle_msg(
@@ -255,6 +256,9 @@ impl WindowsWindowInner {
                 WindowsDispatcher::execute_runnable(runnable);
             }
             self.handle_paint_msg(handle)
+        } else if wparam.0 == IDLE_RESOURCE_RELEASE_TIMER_ID {
+            self.handle_idle_resource_release_timer();
+            Some(0)
         } else {
             None
         }
@@ -272,6 +276,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        self.cancel_idle_resource_release();
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
