@@ -34,6 +34,8 @@ use backdrop::BackdropResources;
 
 #[cfg(test)]
 mod backdrop_tests;
+#[cfg(test)]
+mod path_tests;
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -94,8 +96,26 @@ struct PathScratch {
     srv: Option<ID3D11ShaderResourceView>,
     msaa_texture: ID3D11Texture2D,
     msaa_view: Option<ID3D11RenderTargetView>,
-    width: u32,
-    height: u32,
+    cap_w: u32,
+    cap_h: u32,
+    low_frames: u32,
+}
+
+impl PathScratch {
+    fn new(device: &ID3D11Device, cap_w: u32, cap_h: u32) -> Result<Self> {
+        let (texture, srv) = create_path_intermediate_texture(device, cap_w, cap_h)?;
+        let (msaa_texture, msaa_view) =
+            create_path_intermediate_msaa_texture_and_view(device, cap_w, cap_h)?;
+        Ok(Self {
+            texture,
+            srv,
+            msaa_texture,
+            msaa_view,
+            cap_w,
+            cap_h,
+            low_frames: 0,
+        })
+    }
 }
 
 struct DirectXRenderPipelines {
@@ -111,6 +131,7 @@ struct DirectXRenderPipelines {
 
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
+    path_origin_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
 }
 
@@ -398,6 +419,7 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
+        let mut path_need = [0u32; 2];
         for batch in scene.batches() {
             // Scene batching must split at each blur order. Snapshot before
             // primitives at that order, so nested blurs include earlier glass.
@@ -415,8 +437,13 @@ impl DirectXRenderer {
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
-                    self.draw_paths_from_intermediate(paths)
+                    if let Some(region) = self.draw_paths_to_intermediate(paths)? {
+                        path_need[0] = path_need[0].max(region.size.width);
+                        path_need[1] = path_need[1].max(region.size.height);
+                        self.draw_paths_from_intermediate(paths)
+                    } else {
+                        Ok(())
+                    }
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
@@ -448,7 +475,7 @@ impl DirectXRenderer {
         for blur in blurs {
             self.draw_backdrop_blur(blur)?;
         }
-        Ok(())
+        self.finish_path_frame(path_need)
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -465,7 +492,13 @@ impl DirectXRenderer {
         unsafe { devices.device_context.OMSetRenderTargets(None, None) };
         let resources = self.resources.as_mut().context("resources missing")?;
         resources.backdrop = None;
-        resources.path_scratch = None;
+        if resources
+            .path_scratch
+            .as_ref()
+            .is_some_and(|scratch| scratch.cap_w > width || scratch.cap_h > height)
+        {
+            resources.path_scratch = None;
+        }
         self.path_free_frames = 0;
         resources.render_target.take();
         resources.render_target_view.take();
@@ -505,33 +538,55 @@ impl DirectXRenderer {
         self.path_free_frames = 0;
     }
 
-    fn ensure_path_scratch(&mut self) -> Result<()> {
+    fn ensure_path_scratch(&mut self, width: u32, height: u32) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_mut().context("resources missing")?;
-        if resources
-            .path_scratch
-            .as_ref()
-            .is_some_and(|scratch| scratch.width == self.width && scratch.height == self.height)
-        {
+        let previous = resources.path_scratch.as_ref();
+        if previous.is_some_and(|scratch| scratch.cap_w >= width && scratch.cap_h >= height) {
             return Ok(());
         }
 
+        let cap_w = width
+            .max(previous.map_or(0, |scratch| scratch.cap_w))
+            .div_ceil(64)
+            .saturating_mul(64)
+            .min(self.width);
+        let cap_h = height
+            .max(previous.map_or(0, |scratch| scratch.cap_h))
+            .div_ceil(64)
+            .saturating_mul(64)
+            .min(self.height);
         resources.path_scratch = None;
-        let (texture, srv) =
-            create_path_intermediate_texture(&devices.device, self.width, self.height)?;
-        let (msaa_texture, msaa_view) = create_path_intermediate_msaa_texture_and_view(
-            &devices.device,
-            self.width,
-            self.height,
-        )?;
-        resources.path_scratch = Some(PathScratch {
-            texture,
-            srv,
-            msaa_texture,
-            msaa_view,
-            width: self.width,
-            height: self.height,
-        });
+        resources.path_scratch = Some(PathScratch::new(&devices.device, cap_w, cap_h)?);
+        Ok(())
+    }
+
+    fn finish_path_frame(&mut self, need: [u32; 2]) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        let Some(scratch) = resources.path_scratch.as_mut() else {
+            return Ok(());
+        };
+        // Count whole frames, so a small batch cannot shrink a later batch's scratch.
+        if need[0] > scratch.cap_w / 2 || need[1] > scratch.cap_h / 2 {
+            scratch.low_frames = 0;
+            return Ok(());
+        }
+        scratch.low_frames += 1;
+        if scratch.low_frames < SCRATCH_RELEASE_AFTER_FRAMES {
+            return Ok(());
+        }
+        scratch.low_frames = 0;
+        if need == [0; 2] {
+            resources.path_scratch = None;
+            return Ok(());
+        }
+        let cap_w = need[0].div_ceil(64).saturating_mul(64).min(self.width);
+        let cap_h = need[1].div_ceil(64).saturating_mul(64).min(self.height);
+        if cap_w < scratch.cap_w || cap_h < scratch.cap_h {
+            resources.path_scratch = None;
+            resources.path_scratch = Some(PathScratch::new(&devices.device, cap_w, cap_h)?);
+        }
         Ok(())
     }
 
@@ -633,28 +688,18 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-        self.ensure_path_scratch()?;
+    fn draw_paths_to_intermediate(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+    ) -> Result<Option<Bounds<u32>>> {
+        let Some(region) = path_region(paths, self.width, self.height) else {
+            return Ok(None);
+        };
+        self.ensure_path_scratch(region.size.width, region.size.height)?;
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
         let scratch = resources.path_scratch.as_ref().expect("path scratch missing");
-        // Clear intermediate MSAA texture
-        unsafe {
-            devices.device_context.ClearRenderTargetView(
-                scratch.msaa_view.as_ref().unwrap(),
-                &[0.0; 4],
-            );
-            // Set intermediate MSAA texture as render target
-            devices.device_context.OMSetRenderTargets(
-                Some(slice::from_ref(&scratch.msaa_view)),
-                None,
-            );
-        }
-
         // Collect all vertices and sprites for a single draw call
         let mut vertices = Vec::new();
 
@@ -673,10 +718,38 @@ impl DirectXRenderer {
             &vertices,
         )?;
 
+        update_buffer(
+            &devices.device_context,
+            self.globals.path_origin_buffer.as_ref().unwrap(),
+            &[PathOrigin {
+                origin: [region.origin.x as f32, region.origin.y as f32],
+                tex_size: [scratch.cap_w as f32, scratch.cap_h as f32],
+            }],
+        )?;
+        let viewport = D3D11_VIEWPORT {
+            TopLeftX: -(region.origin.x as f32),
+            TopLeftY: -(region.origin.y as f32),
+            ..resources.viewport
+        };
+        // Clear the cached capacity; pixels outside the batch stay transparent.
+        unsafe {
+            devices.device_context.ClearRenderTargetView(
+                scratch.msaa_view.as_ref().unwrap(),
+                &[0.0; 4],
+            );
+            devices.device_context.OMSetRenderTargets(
+                Some(slice::from_ref(&scratch.msaa_view)),
+                None,
+            );
+        }
         self.pipelines.path_rasterization_pipeline.draw(
             &devices.device_context,
-            slice::from_ref(&resources.viewport),
-            slice::from_ref(&self.globals.global_params_buffer),
+            slice::from_ref(&viewport),
+            &[
+                self.globals.global_params_buffer.clone(),
+                None,
+                self.globals.path_origin_buffer.clone(),
+            ],
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             vertices.len() as u32,
             1,
@@ -697,7 +770,7 @@ impl DirectXRenderer {
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
         }
 
-        Ok(())
+        Ok(Some(region))
     }
 
     fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
@@ -742,7 +815,11 @@ impl DirectXRenderer {
             &devices.device_context,
             slice::from_ref(&scratch.srv),
             slice::from_ref(&resources.viewport),
-            slice::from_ref(&self.globals.global_params_buffer),
+            &[
+                self.globals.global_params_buffer.clone(),
+                None,
+                self.globals.path_origin_buffer.clone(),
+            ],
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
         )?;
@@ -1059,6 +1136,19 @@ impl DirectXGlobalElements {
             buffer
         };
 
+        let path_origin_buffer = unsafe {
+            let desc = D3D11_BUFFER_DESC {
+                ByteWidth: std::mem::size_of::<PathOrigin>() as u32,
+                Usage: D3D11_USAGE_DYNAMIC,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                ..Default::default()
+            };
+            let mut buffer = None;
+            device.CreateBuffer(&desc, None, Some(&mut buffer))?;
+            buffer
+        };
+
         let sampler = unsafe {
             let desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -1079,6 +1169,7 @@ impl DirectXGlobalElements {
 
         Ok(Self {
             global_params_buffer,
+            path_origin_buffer,
             sampler,
         })
     }
@@ -1093,6 +1184,33 @@ struct GlobalParams {
     subpixel_enhanced_contrast: f32,
     is_bgr: u32,
     _pad: [u32; 3],
+}
+
+#[repr(C)]
+struct PathOrigin {
+    origin: [f32; 2],
+    tex_size: [f32; 2],
+}
+
+fn path_region(paths: &[Path<ScaledPixels>], width: u32, height: u32) -> Option<Bounds<u32>> {
+    let mut bounds = paths.first()?.clipped_bounds();
+    for path in paths.iter().skip(1) {
+        bounds = bounds.union(&path.clipped_bounds());
+    }
+    // ScaledPixels are already in device pixels. Intersect before padding so
+    // batches wholly outside the window do not allocate scratch.
+    let x0 = bounds.origin.x.0.max(0.);
+    let y0 = bounds.origin.y.0.max(0.);
+    let x1 = bounds.right().0.min(width as f32);
+    let y1 = bounds.bottom().0.min(height as f32);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let x0 = (x0.floor() - 1.).max(0.) as u32;
+    let y0 = (y0.floor() - 1.).max(0.) as u32;
+    let x1 = (x1.ceil() + 1.).min(width as f32) as u32;
+    let y1 = (y1.ceil() + 1.).min(height as f32) as u32;
+    Some(Bounds::new(point(x0, y0), size(x1 - x0, y1 - y0)))
 }
 
 struct PipelineState<T> {
