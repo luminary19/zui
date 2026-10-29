@@ -1123,6 +1123,115 @@ fn warp_minimize_trim_preserves_frames_across_windows() -> Result<()> {
 }
 
 #[::core::prelude::v1::test]
+fn warp_idle_release_preserves_frames_across_windows() -> Result<()> {
+    let devices = warp_devices()?;
+    let (mut renderer, _window) = warp_renderer_with_devices(&devices)?;
+    let (mut other, _other_window) = warp_renderer_with_devices(&devices)?;
+    let mut scene = path_scene();
+    scene.backdrop_blurs.push(blur(3));
+    scene.finish();
+    let atlas = renderer.atlas.clone();
+
+    for appearance in [
+        WindowBackgroundAppearance::Opaque,
+        WindowBackgroundAppearance::Transparent,
+    ] {
+        renderer.draw_scene(&scene, appearance)?;
+        let expected = pixels(&renderer)?;
+        let resources = renderer.resources.as_ref().unwrap();
+        assert!(resources.path_scratch.is_some());
+        assert!(resources.backdrop.is_some());
+        let swap_chain = resources.swap_chain.clone();
+        let render_target = resources.render_target.clone();
+        let render_target_view = resources.render_target_view.clone();
+
+        // Simulate pause_frame_requests after the last presented frame.
+        renderer.release_idle_resources();
+        let resources = renderer.resources.as_ref().unwrap();
+        assert!(resources.path_scratch.is_none());
+        assert!(resources.backdrop.is_none());
+        assert_eq!(resources.swap_chain, swap_chain);
+        assert_eq!(resources.render_target, render_target);
+        assert_eq!(resources.render_target_view, render_target_view);
+        assert!(Arc::ptr_eq(&renderer.atlas, &atlas));
+        assert_eq!(pixels(&renderer)?, expected);
+
+        other.draw_scene(&scene, appearance)?;
+        assert_eq!(pixels(&other)?, expected);
+        renderer.draw_scene(&scene, appearance)?;
+        assert!(renderer.resources.as_ref().unwrap().path_scratch.is_some());
+        assert!(renderer.resources.as_ref().unwrap().backdrop.is_some());
+        assert_eq!(pixels(&renderer)?, expected);
+    }
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
+fn warp_instance_buffer_shrink_is_best_effort() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    let initial_size = renderer.pipelines.quad_pipeline.initial_size;
+    let mut scene = Scene::default();
+    scene.quads = (0..initial_size * 8)
+        .map(|_| quad(0, bounds(8., 8., 48., 48.), hsla(0.2, 0.8, 0.5, 1.)))
+        .collect();
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    assert_eq!(renderer.pipelines.quad_pipeline.buffer_size, initial_size * 8);
+
+    // Parking must not shrink a buffer that the last frame still filled.
+    renderer.release_idle_resources();
+    assert_eq!(renderer.pipelines.quad_pipeline.buffer_size, initial_size * 8);
+
+    scene.quads.truncate(initial_size + 1);
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    let expected = pixels(&renderer)?;
+    let pipeline = &mut renderer.pipelines.quad_pipeline;
+    let buffer = pipeline.buffer.clone();
+    let view = pipeline.view.clone();
+    pipeline.low_usage_frames = INSTANCE_BUFFER_SHRINK_AFTER_FRAMES - 1;
+    pipeline.fail_next_shrink = true;
+
+    // A failed replacement must not prevent draw_scene from reaching present.
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    let pipeline = &mut renderer.pipelines.quad_pipeline;
+    assert_eq!(pipeline.buffer, buffer);
+    assert_eq!(pipeline.view, view);
+    assert_eq!(pipeline.buffer_size, initial_size * 8);
+    assert_eq!(pipeline.low_usage_frames, 0);
+    assert!(!pipeline.fail_next_shrink);
+    pipeline.fail_next_shrink = true;
+
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    let pipeline = &renderer.pipelines.quad_pipeline;
+    assert_eq!(pipeline.low_usage_frames, 1);
+    assert!(pipeline.fail_next_shrink, "the next frame must not retry the shrink");
+    assert_eq!(pixels(&renderer)?, expected);
+
+    // The same failure handling applies to shrinking when the window parks.
+    renderer.release_idle_resources();
+    let pipeline = &renderer.pipelines.quad_pipeline;
+    assert_eq!(pipeline.buffer, buffer);
+    assert_eq!(pipeline.view, view);
+    assert_eq!(pipeline.buffer_size, initial_size * 8);
+    assert_eq!(pipeline.low_usage_frames, 0);
+    assert!(!pipeline.fail_next_shrink);
+    drop(buffer);
+    drop(view);
+
+    renderer.release_idle_resources();
+    assert_eq!(renderer.pipelines.quad_pipeline.buffer_size, initial_size * 2);
+    assert_eq!(pixels(&renderer)?, expected);
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    assert_eq!(pixels(&renderer)?, expected);
+
+    renderer.draw_scene(&Scene::default(), WindowBackgroundAppearance::Transparent)?;
+    renderer.release_idle_resources();
+    assert_eq!(renderer.pipelines.quad_pipeline.buffer_size, initial_size);
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    assert_eq!(pixels(&renderer)?, expected);
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
 fn warp_path_scratch_cache_lifecycle() -> Result<()> {
     let (mut renderer, _window) = warp_renderer()?;
     let empty = Scene::default();
@@ -1141,8 +1250,8 @@ fn warp_path_scratch_cache_lifecycle() -> Result<()> {
     }
     assert!(renderer.resources.as_ref().unwrap().path_scratch.is_some());
     renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
-    assert_eq!(renderer.path_free_frames, 0);
     let scratch = renderer.resources.as_ref().unwrap().path_scratch.as_ref().unwrap();
+    assert_eq!(scratch.low_frames, 0);
     assert_eq!(scratch.texture, texture, "path frames reuse the resolve texture");
     assert_eq!(scratch.msaa_texture, msaa_texture, "path frames reuse MSAA scratch");
     drop(texture);

@@ -57,7 +57,6 @@ pub(crate) struct DirectXRenderer {
 
     width: u32,
     height: u32,
-    path_free_frames: u32,
 
     /// Whether we want to skip drwaing due to device lost events.
     ///
@@ -230,7 +229,6 @@ impl DirectXRenderer {
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
-            path_free_frames: 0,
             skip_draws: false,
         })
     }
@@ -357,7 +355,6 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
-        self.path_free_frames = 0;
         self.skip_draws = true;
         Ok(())
     }
@@ -391,18 +388,6 @@ impl DirectXRenderer {
         })?;
 
         self.upload_scene_buffers(scene)?;
-
-        if scene.paths.is_empty() {
-            self.path_free_frames = self.path_free_frames.saturating_add(1);
-            if self.path_free_frames >= SCRATCH_RELEASE_AFTER_FRAMES {
-                self.resources
-                    .as_mut()
-                    .context("resources missing")?
-                    .path_scratch = None;
-            }
-        } else {
-            self.path_free_frames = 0;
-        }
 
         {
             // Age unused resources even if the scene contains only clipped or
@@ -482,14 +467,14 @@ impl DirectXRenderer {
         self.finish_path_frame(path_need)?;
 
         let device = &self.devices.as_ref().context("devices missing")?.device;
-        self.pipelines.shadow_pipeline.end_frame(device)?;
-        self.pipelines.quad_pipeline.end_frame(device)?;
-        self.pipelines.path_rasterization_pipeline.end_frame(device)?;
-        self.pipelines.path_sprite_pipeline.end_frame(device)?;
-        self.pipelines.underline_pipeline.end_frame(device)?;
-        self.pipelines.mono_sprites.end_frame(device)?;
-        self.pipelines.subpixel_sprites.end_frame(device)?;
-        self.pipelines.poly_sprites.end_frame(device)?;
+        self.pipelines.shadow_pipeline.end_frame(device);
+        self.pipelines.quad_pipeline.end_frame(device);
+        self.pipelines.path_rasterization_pipeline.end_frame(device);
+        self.pipelines.path_sprite_pipeline.end_frame(device);
+        self.pipelines.underline_pipeline.end_frame(device);
+        self.pipelines.mono_sprites.end_frame(device);
+        self.pipelines.subpixel_sprites.end_frame(device);
+        self.pipelines.poly_sprites.end_frame(device);
         Ok(())
     }
 
@@ -514,7 +499,6 @@ impl DirectXRenderer {
         {
             resources.path_scratch = None;
         }
-        self.path_free_frames = 0;
         resources.render_target.take();
         resources.render_target_view.take();
 
@@ -546,13 +530,37 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    pub(crate) fn release_idle_resources(&mut self) {
+        if let Some(resources) = self.resources.as_mut() {
+            resources.backdrop = None;
+            resources.path_scratch = None;
+        }
+        let Some(devices) = &self.devices else {
+            return;
+        };
+        // The context retains instance views even after their buffers are replaced.
+        unsafe {
+            devices.device_context.VSSetShaderResources(1, Some(&[None]));
+            devices.device_context.PSSetShaderResources(1, Some(&[None]));
+        }
+        let device = &devices.device;
+        self.pipelines.shadow_pipeline.shrink_for_idle(device);
+        self.pipelines.quad_pipeline.shrink_for_idle(device);
+        self.pipelines.path_rasterization_pipeline.shrink_for_idle(device);
+        self.pipelines.path_sprite_pipeline.shrink_for_idle(device);
+        self.pipelines.underline_pipeline.shrink_for_idle(device);
+        self.pipelines.mono_sprites.shrink_for_idle(device);
+        self.pipelines.subpixel_sprites.shrink_for_idle(device);
+        self.pipelines.poly_sprites.shrink_for_idle(device);
+        // Submit deferred destruction before the window stops drawing.
+        unsafe { devices.device_context.Flush() };
+    }
+
     pub(crate) fn trim_for_minimize(&mut self) {
         if let Some(resources) = self.resources.as_mut() {
             resources.backdrop = None;
             resources.path_scratch = None;
         }
-        self.path_free_frames = 0;
-
         if let Some(devices) = &self.devices {
             unsafe {
                 devices.device_context.OMSetRenderTargets(None, None);
@@ -1248,7 +1256,10 @@ struct PipelineState<T> {
     buffer_size: usize,
     initial_size: usize,
     peak_this_frame: usize,
+    last_frame_peak: usize,
     low_usage_frames: u32,
+    #[cfg(test)]
+    fail_next_shrink: bool,
     view: Option<ID3D11ShaderResourceView>,
     blend_state: ID3D11BlendState,
     _marker: std::marker::PhantomData<T>,
@@ -1281,7 +1292,10 @@ impl<T> PipelineState<T> {
             buffer_size,
             initial_size: buffer_size,
             peak_this_frame: 0,
+            last_frame_peak: 0,
             low_usage_frames: 0,
+            #[cfg(test)]
+            fail_next_shrink: false,
             view,
             blend_state,
             _marker: std::marker::PhantomData,
@@ -1312,29 +1326,50 @@ impl<T> PipelineState<T> {
         update_buffer(device_context, &self.buffer, data)
     }
 
-    fn end_frame(&mut self, device: &ID3D11Device) -> Result<()> {
-        let peak_this_frame = std::mem::take(&mut self.peak_this_frame);
-        if self.buffer_size > self.initial_size && peak_this_frame <= self.buffer_size / 2 {
+    fn end_frame(&mut self, device: &ID3D11Device) {
+        self.last_frame_peak = std::mem::take(&mut self.peak_this_frame);
+        if self.buffer_size > self.initial_size && self.last_frame_peak <= self.buffer_size / 2 {
             self.low_usage_frames += 1;
             if self.low_usage_frames >= INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
                 let new_buffer_size = (self.buffer_size / 2).max(self.initial_size);
-                log::debug!(
-                    "Updating {} buffer size from {} to {}",
-                    self.label,
-                    self.buffer_size,
-                    new_buffer_size
-                );
-                let buffer = create_buffer(device, std::mem::size_of::<T>(), new_buffer_size)?;
-                let view = create_buffer_view(device, &buffer)?;
-                self.buffer = buffer;
-                self.view = view;
-                self.buffer_size = new_buffer_size;
-                self.low_usage_frames = 0;
+                self.shrink_buffer(device, new_buffer_size);
             }
         } else {
             self.low_usage_frames = 0;
         }
-        Ok(())
+    }
+
+    fn shrink_for_idle(&mut self, device: &ID3D11Device) {
+        self.low_usage_frames = 0;
+        if self.buffer_size > self.initial_size && self.last_frame_peak <= self.buffer_size / 2 {
+            let new_buffer_size = self.last_frame_peak.next_power_of_two().max(self.initial_size);
+            self.shrink_buffer(device, new_buffer_size);
+        }
+    }
+
+    fn shrink_buffer(&mut self, device: &ID3D11Device, new_buffer_size: usize) {
+        self.low_usage_frames = 0;
+        log::debug!(
+            "Updating {} buffer size from {} to {}",
+            self.label,
+            self.buffer_size,
+            new_buffer_size
+        );
+        let result = (|| -> Result<()> {
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_shrink) {
+                anyhow::bail!("Forced instance buffer shrink failure");
+            }
+            let buffer = create_buffer(device, std::mem::size_of::<T>(), new_buffer_size)?;
+            let view = create_buffer_view(device, &buffer)?;
+            self.buffer = buffer;
+            self.view = view;
+            self.buffer_size = new_buffer_size;
+            Ok(())
+        })();
+        result
+            .with_context(|| format!("Shrinking {} buffer", self.label))
+            .log_err();
     }
 
     fn draw(
