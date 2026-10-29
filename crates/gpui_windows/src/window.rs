@@ -32,6 +32,38 @@ use crate::direct_manipulation::DirectManipulationHandler;
 use crate::*;
 use gpui::*;
 
+const IDLE_RESOURCE_RELEASE_DELAY: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Default)]
+struct IdleResourceRelease {
+    deadline: Option<Instant>,
+    released_while_parked: bool,
+}
+
+impl IdleResourceRelease {
+    fn pause(&mut self, now: Instant) -> bool {
+        if self.released_while_parked {
+            return false;
+        }
+        self.deadline = Some(now + IDLE_RESOURCE_RELEASE_DELAY);
+        true
+    }
+
+    fn resume(&mut self) {
+        self.deadline = None;
+        self.released_while_parked = false;
+    }
+
+    fn release_if_due(&mut self, now: Instant) -> bool {
+        if self.released_while_parked || self.deadline.is_none_or(|deadline| now < deadline) {
+            return false;
+        }
+        self.deadline = None;
+        self.released_while_parked = true;
+        true
+    }
+}
+
 pub(crate) struct WindowsWindow(pub Rc<WindowsWindowInner>);
 
 impl std::ops::Deref for WindowsWindow {
@@ -81,6 +113,7 @@ pub struct WindowsWindowState {
     /// as resizing them has failed, causing us to have lost at least the render target.
     pub invalidate_devices: Arc<AtomicBool>,
     pub frame_demand: Arc<FrameDemand>,
+    idle_resource_release: Cell<IdleResourceRelease>,
     fullscreen: Cell<Option<StyleAndBounds>>,
     initial_placement: Cell<Option<WindowOpenStatus>>,
     hwnd: HWND,
@@ -182,6 +215,7 @@ impl WindowsWindowState {
             hwnd,
             invalidate_devices,
             frame_demand,
+            idle_resource_release: Cell::default(),
             direct_manipulation,
             a11y: RefCell::new(None),
         })
@@ -370,6 +404,66 @@ impl WindowsWindowInner {
 
     pub(crate) fn system_settings(&self) -> &WindowsSystemSettings {
         &self.system_settings
+    }
+
+    pub(crate) fn resume_frame_requests(&self) {
+        self.cancel_idle_resource_release();
+        self.state.frame_demand.request();
+    }
+
+    fn arm_idle_resource_release(&self) {
+        let mut release = self.state.idle_resource_release.get();
+        if release.pause(Instant::now()) {
+            self.state.idle_resource_release.set(release);
+            self.set_idle_resource_release_timer(IDLE_RESOURCE_RELEASE_DELAY);
+        }
+    }
+
+    fn set_idle_resource_release_timer(&self, delay: Duration) {
+        let ret = unsafe {
+            SetTimer(
+                Some(self.hwnd),
+                IDLE_RESOURCE_RELEASE_TIMER_ID,
+                delay.as_millis().max(1) as u32,
+                None,
+            )
+        };
+        if ret == 0 {
+            log::error!(
+                "unable to create idle resource release timer: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    pub(crate) fn cancel_idle_resource_release(&self) {
+        let mut release = self.state.idle_resource_release.get();
+        release.resume();
+        self.state.idle_resource_release.set(release);
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), IDLE_RESOURCE_RELEASE_TIMER_ID);
+        }
+    }
+
+    pub(crate) fn handle_idle_resource_release_timer(&self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), IDLE_RESOURCE_RELEASE_TIMER_ID);
+        }
+        if self.state.frame_demand.is_requested() {
+            self.cancel_idle_resource_release();
+            return;
+        }
+
+        let now = Instant::now();
+        let mut release = self.state.idle_resource_release.get();
+        let should_release = release.release_if_due(now);
+        self.state.idle_resource_release.set(release);
+        if should_release {
+            self.state.renderer.borrow_mut().release_idle_resources();
+        } else if let Some(deadline) = release.deadline {
+            // KillTimer does not remove an already queued WM_TIMER from an earlier pause.
+            self.set_idle_resource_release_timer(deadline.saturating_duration_since(now));
+        }
     }
 }
 
@@ -931,8 +1025,12 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn frame_requester(&self) -> Option<Rc<dyn Fn()>> {
-        let frame_demand = self.state.frame_demand.clone();
-        Some(Rc::new(move || frame_demand.request()))
+        let window = Rc::downgrade(&self.0);
+        Some(Rc::new(move || {
+            if let Some(window) = window.upgrade() {
+                window.resume_frame_requests();
+            }
+        }))
     }
 
     fn pause_frame_requests(&self) {
@@ -940,7 +1038,7 @@ impl PlatformWindow for WindowsWindow {
         // keeps frames coming until it settles.
         if !self.state.direct_manipulation.is_active() {
             self.state.frame_demand.pause();
-            self.state.renderer.borrow_mut().release_idle_resources();
+            self.arm_idle_resource_release();
         }
     }
 
@@ -997,6 +1095,7 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        self.cancel_idle_resource_release();
         self.state
             .renderer
             .borrow_mut()
@@ -1631,9 +1730,55 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::ClickState;
+    use super::{ClickState, IDLE_RESOURCE_RELEASE_DELAY, IdleResourceRelease};
     use gpui::{DevicePixels, MouseButton, point};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_release_is_cancelled_on_resume() {
+        let now = Instant::now();
+        let mut release = IdleResourceRelease::default();
+        assert!(release.pause(now));
+        assert!(!release.release_if_due(now + Duration::from_secs(1)));
+        release.resume();
+        assert!(!release.release_if_due(now + IDLE_RESOURCE_RELEASE_DELAY));
+    }
+
+    #[test]
+    fn idle_release_runs_once_per_parked_span() {
+        let now = Instant::now();
+        let mut release = IdleResourceRelease::default();
+        assert!(release.pause(now));
+        assert!(release.release_if_due(now + IDLE_RESOURCE_RELEASE_DELAY));
+        assert!(!release.release_if_due(now + Duration::from_secs(3)));
+        assert!(!release.pause(now + Duration::from_secs(3)));
+        assert!(!release.release_if_due(now + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn idle_release_rearms_after_resume() {
+        let now = Instant::now();
+        let mut release = IdleResourceRelease::default();
+        assert!(release.pause(now));
+        assert!(release.release_if_due(now + IDLE_RESOURCE_RELEASE_DELAY));
+        release.resume();
+        assert!(release.pause(now + Duration::from_secs(3)));
+        assert!(!release.release_if_due(now + Duration::from_secs(4)));
+        assert!(release.release_if_due(now + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn idle_release_ignores_timer_from_earlier_pause() {
+        let now = Instant::now();
+        let mut release = IdleResourceRelease::default();
+        assert!(release.pause(now));
+        release.resume();
+        assert!(release.pause(now + Duration::from_secs(1)));
+        assert!(!release.release_if_due(now + IDLE_RESOURCE_RELEASE_DELAY));
+        assert!(release.pause(now + Duration::from_secs(2)));
+        assert!(!release.release_if_due(now + Duration::from_secs(3)));
+        assert!(release.release_if_due(now + Duration::from_secs(4)));
+    }
 
     #[test]
     fn test_double_click_interval() {
