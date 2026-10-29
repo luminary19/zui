@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::Result;
 use gpui::*;
@@ -26,10 +27,18 @@ pub(crate) struct DirectManipulationHandler {
     window: HWND,
     scale_factor: Rc<Cell<f32>>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+    activity: Rc<GestureActivity>,
+}
+
+/// Whether a gesture still needs `update` on every frame.
+#[derive(Default)]
+struct GestureActivity {
+    interacting: Cell<bool>,
+    moving: Cell<bool>,
 }
 
 impl DirectManipulationHandler {
-    pub fn new(window: HWND, scale_factor: f32) -> Result<Self> {
+    pub fn new(window: HWND, scale_factor: f32, frame_demand: Arc<FrameDemand>) -> Result<Self> {
         unsafe {
             let manager: IDirectManipulationManager =
                 CoCreateInstance(&DirectManipulationManager, None, CLSCTX_INPROC_SERVER)?;
@@ -65,12 +74,15 @@ impl DirectManipulationHandler {
 
             let scale_factor = Rc::new(Cell::new(scale_factor));
             let pending_events = Rc::new(RefCell::new(Vec::new()));
+            let activity = Rc::new(GestureActivity::default());
 
             let event_handler: IDirectManipulationViewportEventHandler =
                 DirectManipulationEventHandler::new(
                     window,
                     Rc::clone(&scale_factor),
                     Rc::clone(&pending_events),
+                    Rc::clone(&activity),
+                    frame_demand,
                 )
                 .into();
 
@@ -86,6 +98,7 @@ impl DirectManipulationHandler {
                 window,
                 scale_factor,
                 pending_events,
+                activity,
             })
         }
     }
@@ -114,6 +127,10 @@ impl DirectManipulationHandler {
     pub fn drain_events(&self) -> Vec<PlatformInput> {
         std::mem::take(&mut *self.pending_events.borrow_mut())
     }
+
+    pub fn is_active(&self) -> bool {
+        self.activity.interacting.get() || self.activity.moving.get()
+    }
 }
 
 impl Drop for DirectManipulationHandler {
@@ -133,7 +150,10 @@ enum GestureKind {
     Pinch,
 }
 
-#[windows_core::implement(IDirectManipulationViewportEventHandler)]
+#[windows_core::implement(
+    IDirectManipulationViewportEventHandler,
+    IDirectManipulationInteractionEventHandler
+)]
 struct DirectManipulationEventHandler {
     window: HWND,
     scale_factor: Rc<Cell<f32>>,
@@ -143,6 +163,8 @@ struct DirectManipulationEventHandler {
     last_y_offset: Cell<f32>,
     scroll_phase: Cell<TouchPhase>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+    activity: Rc<GestureActivity>,
+    frame_demand: Arc<FrameDemand>,
 }
 
 impl DirectManipulationEventHandler {
@@ -150,6 +172,8 @@ impl DirectManipulationEventHandler {
         window: HWND,
         scale_factor: Rc<Cell<f32>>,
         pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+        activity: Rc<GestureActivity>,
+        frame_demand: Arc<FrameDemand>,
     ) -> Self {
         Self {
             window,
@@ -160,6 +184,8 @@ impl DirectManipulationEventHandler {
             last_y_offset: Cell::new(0.0),
             scroll_phase: Cell::new(TouchPhase::Started),
             pending_events,
+            activity,
+            frame_demand,
         }
     }
 
@@ -212,6 +238,12 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
     ) -> windows_core::Result<()> {
         if current == previous {
             return Ok(());
+        }
+
+        let moving = current == DIRECTMANIPULATION_RUNNING || current == DIRECTMANIPULATION_INERTIA;
+        self.activity.moving.set(moving);
+        if moving {
+            self.frame_demand.request();
         }
 
         // A new gesture interrupted inertia, so end the old sequence.
@@ -349,6 +381,24 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
         self.last_x_offset.set(x_offset);
         self.last_y_offset.set(y_offset);
 
+        Ok(())
+    }
+}
+
+impl IDirectManipulationInteractionEventHandler_Impl for DirectManipulationEventHandler_Impl {
+    fn OnInteraction(
+        &self,
+        _viewport: windows_core::Ref<'_, IDirectManipulationViewport2>,
+        interaction: DIRECTMANIPULATION_INTERACTION_TYPE,
+    ) -> windows_core::Result<()> {
+        // Interactions are reported without `update`, so this is what restarts the
+        // frames of a parked window when a gesture begins.
+        if interaction == DIRECTMANIPULATION_INTERACTION_BEGIN {
+            self.activity.interacting.set(true);
+            self.frame_demand.request();
+        } else if interaction == DIRECTMANIPULATION_INTERACTION_END {
+            self.activity.interacting.set(false);
+        }
         Ok(())
     }
 }

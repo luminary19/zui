@@ -1,10 +1,14 @@
 use std::{
-    sync::LazyLock,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
+use parking_lot::{Condvar, Mutex};
 use windows::Win32::{
     Foundation::HWND,
     Graphics::Dwm::{DWM_TIMING_INFO, DwmFlush, DwmGetCompositionTimingInfo},
@@ -21,6 +25,8 @@ static QPC_TICKS_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
 
 const VSYNC_INTERVAL_THRESHOLD: Duration = Duration::from_millis(1);
 const DEFAULT_VSYNC_INTERVAL: Duration = Duration::from_micros(16_666); // ~60Hz
+/// How often a parked `VSyncProvider` thread still wakes to check for GPU device loss.
+pub(crate) const PARKED_DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) struct VSyncProvider {
     interval: Duration,
@@ -55,6 +61,61 @@ impl VSyncProvider {
     }
 }
 
+/// Parks the `VSyncProvider` thread while no window wants frames.
+#[derive(Default)]
+pub(crate) struct VSyncWaker {
+    parked: Mutex<()>,
+    wake: Condvar,
+}
+
+impl VSyncWaker {
+    /// Blocks until `is_demanded` holds, a window requests frames, or `timeout` elapses.
+    /// May also return spuriously, so callers re-check demand after it returns.
+    pub(crate) fn park(&self, timeout: Duration, is_demanded: impl FnOnce() -> bool) {
+        let mut parked = self.parked.lock();
+        // Requests set their flag before taking `parked`, so a request either is
+        // visible to this check or notifies only once we are waiting.
+        if !is_demanded() {
+            self.wake.wait_for(&mut parked, timeout);
+        }
+    }
+
+    fn wake(&self) {
+        let _parked = self.parked.lock();
+        self.wake.notify_one();
+    }
+}
+
+/// One window's demand for vsync frames, the Windows counterpart of the display link
+/// the macOS backend starts and stops.
+pub(crate) struct FrameDemand {
+    requested: AtomicBool,
+    waker: Arc<VSyncWaker>,
+}
+
+impl FrameDemand {
+    pub(crate) fn new(waker: Arc<VSyncWaker>) -> Self {
+        Self {
+            requested: AtomicBool::new(true),
+            waker,
+        }
+    }
+
+    pub(crate) fn request(&self) {
+        if !self.requested.swap(true, Ordering::AcqRel) {
+            self.waker.wake();
+        }
+    }
+
+    pub(crate) fn pause(&self) {
+        self.requested.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
 fn get_dwm_interval() -> Result<Duration> {
     let mut timing_info = DWM_TIMING_INFO {
         cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
@@ -78,4 +139,42 @@ fn get_dwm_interval() -> Result<Duration> {
 fn retrieve_duration(counts: u64, ticks_per_second: u64) -> Duration {
     let ticks_per_microsecond = ticks_per_second / 1_000_000;
     Duration::from_micros(counts / ticks_per_microsecond)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn park_times_out_while_paused() {
+        let demand = FrameDemand::new(Arc::default());
+        demand.pause();
+        let start = Instant::now();
+        demand
+            .waker
+            .park(Duration::from_millis(50), || demand.is_requested());
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        assert!(!demand.is_requested());
+    }
+
+    #[test]
+    fn request_after_pause_wakes_parked_thread() {
+        let demand = Arc::new(FrameDemand::new(Arc::default()));
+        demand.pause();
+        let parked = std::thread::spawn({
+            let demand = demand.clone();
+            move || {
+                let start = Instant::now();
+                while !demand.is_requested() {
+                    demand
+                        .waker
+                        .park(Duration::from_secs(30), || demand.is_requested());
+                }
+                start.elapsed()
+            }
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        demand.request();
+        assert!(parked.join().unwrap() < Duration::from_secs(30));
+    }
 }

@@ -80,6 +80,7 @@ pub struct WindowsWindowState {
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
     pub invalidate_devices: Arc<AtomicBool>,
+    pub frame_demand: Arc<FrameDemand>,
     fullscreen: Cell<Option<StyleAndBounds>>,
     initial_placement: Cell<Option<WindowOpenStatus>>,
     hwnd: HWND,
@@ -115,6 +116,7 @@ impl WindowsWindowState {
         appearance: WindowAppearance,
         disable_direct_composition: bool,
         invalidate_devices: Arc<AtomicBool>,
+        frame_demand: Arc<FrameDemand>,
     ) -> Result<Self> {
         let scale_factor = {
             let monitor_dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
@@ -147,8 +149,9 @@ impl WindowsWindowState {
         let fullscreen = None;
         let initial_placement = None;
 
-        let direct_manipulation = DirectManipulationHandler::new(hwnd, scale_factor)
-            .context("initializing Direct Manipulation")?;
+        let direct_manipulation =
+            DirectManipulationHandler::new(hwnd, scale_factor, frame_demand.clone())
+                .context("initializing Direct Manipulation")?;
 
         Ok(Self {
             origin: Cell::new(origin),
@@ -178,6 +181,7 @@ impl WindowsWindowState {
             initial_placement: Cell::new(initial_placement),
             hwnd,
             invalidate_devices,
+            frame_demand,
             direct_manipulation,
             a11y: RefCell::new(None),
         })
@@ -255,6 +259,7 @@ impl WindowsWindowInner {
             context.appearance,
             context.disable_direct_composition,
             context.invalidate_devices.clone(),
+            context.frame_demand.clone(),
         )?;
 
         Ok(Rc::new(Self {
@@ -402,6 +407,7 @@ struct WindowCreateContext {
     disable_direct_composition: bool,
     directx_devices: DirectXDevices,
     invalidate_devices: Arc<AtomicBool>,
+    frame_demand: Arc<FrameDemand>,
     parent_hwnd: Option<HWND>,
 }
 
@@ -429,6 +435,7 @@ impl WindowsWindow {
             disable_direct_composition,
             directx_devices,
             invalidate_devices,
+            frame_demand,
         } = creation_info;
         register_window_class(icon);
         let parent_hwnd = if params.kind == WindowKind::Dialog {
@@ -513,6 +520,7 @@ impl WindowsWindow {
             disable_direct_composition,
             directx_devices,
             invalidate_devices,
+            frame_demand,
             parent_hwnd,
         };
         let creation_result = unsafe {
@@ -920,6 +928,19 @@ impl PlatformWindow for WindowsWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.state.callbacks.request_frame.set(Some(callback));
+    }
+
+    fn frame_requester(&self) -> Option<Rc<dyn Fn()>> {
+        let frame_demand = self.state.frame_demand.clone();
+        Some(Rc::new(move || frame_demand.request()))
+    }
+
+    fn pause_frame_requests(&self) {
+        // Direct Manipulation is updated from `draw_window`, so a touchpad gesture
+        // keeps frames coming until it settles.
+        if !self.state.direct_manipulation.is_active() {
+            self.state.frame_demand.pause();
+        }
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
