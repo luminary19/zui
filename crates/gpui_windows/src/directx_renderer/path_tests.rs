@@ -332,7 +332,7 @@ fn warp_region_paths_match_full_window() -> Result<()> {
                 WindowBackgroundAppearance::Opaque,
                 WindowBackgroundAppearance::Transparent,
             ] {
-                region.release_path_scratch();
+                region.trim_for_minimize();
                 let expected = full_window_pixels(&mut full, &scene, appearance)?;
                 region.draw_scene(&scene, appearance)?;
                 assert_same_pixels(&pixels(&region)?, &expected, width as u32, case);

@@ -77,7 +77,7 @@ pub(crate) struct DirectXRendererDevices {
 }
 
 struct DirectXResources {
-    // Created only when a visible backdrop is drawn; dropped on resize/recovery.
+    // Created only when a visible backdrop is drawn; dropped on resize/recovery/minimize.
     backdrop: Option<BackdropResources>,
     // Direct3D rendering objects
     swap_chain: IDXGISwapChain1,
@@ -133,6 +133,7 @@ struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     path_origin_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    rasterizer_state: ID3D11RasterizerState,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -257,6 +258,8 @@ impl DirectXRenderer {
             }],
         )?;
         unsafe {
+            // Another window may have cleared the shared immediate context on minimize.
+            device_context.RSSetState(Some(&self.globals.rasterizer_state));
             device_context.ClearRenderTargetView(
                 resources
                     .render_target_view
@@ -531,11 +534,23 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    pub(crate) fn release_path_scratch(&mut self) {
+    pub(crate) fn trim_for_minimize(&mut self) {
         if let Some(resources) = self.resources.as_mut() {
+            resources.backdrop = None;
             resources.path_scratch = None;
         }
         self.path_free_frames = 0;
+
+        if let Some(devices) = &self.devices {
+            unsafe {
+                devices.device_context.OMSetRenderTargets(None, None);
+                devices.device_context.ClearState();
+                devices.device_context.Flush();
+            }
+            if let Ok(dxgi_device) = devices.device.cast::<IDXGIDevice3>() {
+                unsafe { dxgi_device.Trim() };
+            }
+        }
     }
 
     fn ensure_path_scratch(&mut self, width: u32, height: u32) -> Result<()> {
@@ -998,7 +1013,6 @@ impl DirectXResources {
 
         let (render_target, render_target_view, viewport) =
             create_resources(devices, &swap_chain, width, height)?;
-        set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
             backdrop: None,
@@ -1171,6 +1185,7 @@ impl DirectXGlobalElements {
             global_params_buffer,
             path_origin_buffer,
             sampler,
+            rasterizer_state: create_rasterizer_state(device)?,
         })
     }
 }
@@ -1584,7 +1599,7 @@ fn set_viewport(device_context: &ID3D11DeviceContext, width: f32, height: f32) -
 }
 
 #[inline]
-fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceContext) -> Result<()> {
+fn create_rasterizer_state(device: &ID3D11Device) -> Result<ID3D11RasterizerState> {
     let desc = D3D11_RASTERIZER_DESC {
         FillMode: D3D11_FILL_SOLID,
         CullMode: D3D11_CULL_NONE,
@@ -1597,13 +1612,11 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         MultisampleEnable: true.into(),
         AntialiasedLineEnable: false.into(),
     };
-    let rasterizer_state = unsafe {
+    unsafe {
         let mut state = None;
         device.CreateRasterizerState(&desc, Some(&mut state))?;
-        state.unwrap()
-    };
-    unsafe { device_context.RSSetState(&rasterizer_state) };
-    Ok(())
+        Ok(state.unwrap())
+    }
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_blend_desc
