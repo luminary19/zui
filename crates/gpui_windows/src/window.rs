@@ -940,6 +940,7 @@ impl PlatformWindow for WindowsWindow {
         // keeps frames coming until it settles.
         if !self.state.direct_manipulation.is_active() {
             self.state.frame_demand.pause();
+            self.state.renderer.borrow_mut().release_idle_resources();
         }
     }
 
