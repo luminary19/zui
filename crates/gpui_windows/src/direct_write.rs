@@ -26,6 +26,9 @@ use windows_numerics::Vector2;
 use crate::*;
 use gpui::*;
 
+#[implement]
+struct FontBytes(Cow<'static, [u8]>);
+
 #[derive(Debug)]
 struct FontInfo {
     font_family_h: HSTRING,
@@ -353,29 +356,19 @@ impl DirectWriteState {
         fonts: Vec<Cow<'static, [u8]>>,
     ) -> Result<()> {
         for font_data in fonts {
-            match font_data {
-                Cow::Borrowed(data) => unsafe {
-                    let font_file = components
-                        .in_memory_loader
-                        .CreateInMemoryFontFileReference(
-                            &components.factory,
-                            data.as_ptr().cast(),
-                            data.len() as _,
-                            None,
-                        )?;
-                    components.builder.AddFontFile(&font_file)?;
-                },
-                Cow::Owned(data) => unsafe {
-                    let font_file = components
-                        .in_memory_loader
-                        .CreateInMemoryFontFileReference(
-                            &components.factory,
-                            data.as_ptr().cast(),
-                            data.len() as _,
-                            None,
-                        )?;
-                    components.builder.AddFontFile(&font_file)?;
-                },
+            // DirectWrite retains the owner instead of copying the font data.
+            let owner = ComObject::new(FontBytes(font_data));
+            let data = &owner.get().0;
+            unsafe {
+                let font_file = components
+                    .in_memory_loader
+                    .CreateInMemoryFontFileReference(
+                        &components.factory,
+                        data.as_ptr().cast(),
+                        data.len() as _,
+                        owner.as_interface::<IUnknown>(),
+                    )?;
+                components.builder.AddFontFile(&font_file)?;
             }
         }
         let set = unsafe { components.builder.CreateFontSet()? };
