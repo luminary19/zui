@@ -1657,7 +1657,7 @@ fn report_live_objects(device: &ID3D11Device) -> Result<()> {
     Ok(())
 }
 
-const BUFFER_COUNT: usize = 3;
+const BUFFER_COUNT: usize = 2;
 
 pub(crate) mod shader_resources {
     use anyhow::Result;
