@@ -56,8 +56,11 @@ fn warp_devices() -> Result<DirectXDevices> {
 }
 
 pub(super) fn warp_renderer() -> Result<(DirectXRenderer, TestWindow)> {
+    warp_renderer_with_devices(&warp_devices()?)
+}
+
+fn warp_renderer_with_devices(devices: &DirectXDevices) -> Result<(DirectXRenderer, TestWindow)> {
     unsafe {
-        let devices = warp_devices()?;
         // A hidden built-in window class avoids a message loop and custom WndProc.
         let window = TestWindow(CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -73,7 +76,7 @@ pub(super) fn warp_renderer() -> Result<(DirectXRenderer, TestWindow)> {
             None,
             None,
         )?);
-        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        let mut renderer = DirectXRenderer::new(window.0, devices, true)?;
         renderer.resize(size(DevicePixels(64), DevicePixels(64)))?;
         Ok((renderer, window))
     }
@@ -1064,6 +1067,62 @@ fn warp_lazy_path_scratch_matches_eager_resources() -> Result<()> {
 }
 
 #[::core::prelude::v1::test]
+fn warp_minimize_trim_preserves_frames_across_windows() -> Result<()> {
+    let devices = warp_devices()?;
+    let (mut renderer, _window) = warp_renderer_with_devices(&devices)?;
+    let (mut other, _other_window) = warp_renderer_with_devices(&devices)?;
+    let mut scene = path_scene();
+    scene.backdrop_blurs.push(blur(3));
+    scene.finish();
+
+    for appearance in [
+        WindowBackgroundAppearance::Opaque,
+        WindowBackgroundAppearance::Transparent,
+    ] {
+        renderer.draw_scene(&scene, appearance)?;
+        let expected = pixels(&renderer)?;
+        other.draw_scene(&scene, appearance)?;
+        assert_eq!(pixels(&other)?, expected);
+
+        let resources = renderer.resources.as_ref().unwrap();
+        assert!(resources.backdrop.is_some());
+        assert!(resources.path_scratch.is_some());
+        let swap_chain = resources.swap_chain.clone();
+        let render_target = resources.render_target.clone();
+
+        renderer.trim_for_minimize();
+        let resources = renderer.resources.as_ref().unwrap();
+        assert!(resources.backdrop.is_none());
+        assert!(resources.path_scratch.is_none());
+        assert_eq!(resources.swap_chain, swap_chain);
+        assert_eq!(resources.render_target, render_target);
+        assert_eq!((renderer.width, renderer.height), (64, 64));
+        assert_eq!(pixels(&renderer)?, expected);
+
+        // A visible window sharing the context must restore its rasterizer too.
+        other.draw_scene(&scene, appearance)?;
+        assert_eq!(pixels(&other)?, expected);
+        assert_eq!(
+            unsafe { devices.device_context.RSGetState()? },
+            other.globals.rasterizer_state,
+        );
+
+        // Clear again so the restored window must rebind without a resize.
+        renderer.trim_for_minimize();
+        renderer.draw_scene(&scene, appearance)?;
+        assert_eq!(pixels(&renderer)?, expected);
+        assert_eq!(
+            unsafe { devices.device_context.RSGetState()? },
+            renderer.globals.rasterizer_state,
+        );
+        let resources = renderer.resources.as_ref().unwrap();
+        assert!(resources.backdrop.is_some());
+        assert!(resources.path_scratch.is_some());
+    }
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
 fn warp_path_scratch_cache_lifecycle() -> Result<()> {
     let (mut renderer, _window) = warp_renderer()?;
     let empty = Scene::default();
@@ -1112,7 +1171,7 @@ fn warp_path_scratch_cache_lifecycle() -> Result<()> {
     assert_eq!(pixels(&renderer)?, expected);
 
     // SIZE_MINIMIZED releases scratch without changing the drawable size.
-    renderer.release_path_scratch();
+    renderer.trim_for_minimize();
     assert!(renderer.resources.as_ref().unwrap().path_scratch.is_none());
     renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
     assert_eq!(pixels(&renderer)?, expected);
