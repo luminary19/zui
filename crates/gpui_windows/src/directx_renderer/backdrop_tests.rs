@@ -997,3 +997,139 @@ fn warp_invalid_geometry_allocates_nothing_and_idle_cache_expires() -> Result<()
     assert!(renderer.resources.as_ref().unwrap().backdrop.is_none());
     Ok(())
 }
+
+fn path_scene() -> Scene {
+    let mut scene = Scene::default();
+    scene
+        .quads
+        .push(quad(0, bounds(0., 0., 64., 64.), hsla(0., 0., 0.2, 0.8)));
+    for (order, offset) in [(1, 0.), (2, 8.), (4, 24.)] {
+        let mut path = gpui::Path::new(point(px(offset), px(8.25)));
+        path.line_to(point(px(offset + 40.), px(8.25)));
+        path.curve_to(
+            point(px(offset + 40.), px(56.)),
+            point(px(offset + 24.), px(40.)),
+        );
+        let mut path = path.scale(1.);
+        path.order = order;
+        path.color = linear_gradient(
+            135.,
+            linear_color_stop(hsla(0., 1., 0.5, 0.5), 0.),
+            linear_color_stop(hsla(0.6, 1., 0.5, 0.75), 1.),
+        );
+        path.content_mask.bounds = if order == 2 {
+            bounds(16.5, 16.5, 32., 32.)
+        } else {
+            bounds(0., 0., 64., 64.)
+        };
+        for vertex in &mut path.vertices {
+            vertex.content_mask = path.content_mask;
+        }
+        scene.paths.push(path);
+    }
+    // Separate path batches, with mixed orders in the first batch.
+    scene
+        .quads
+        .push(quad(3, bounds(24., 24., 8., 8.), hsla(0., 0., 1., 0.5)));
+    scene.finish();
+    scene
+}
+
+#[::core::prelude::v1::test]
+fn warp_lazy_path_scratch_matches_eager_resources() -> Result<()> {
+    let (mut lazy, _lazy_window) = warp_renderer()?;
+    let (mut eager, _eager_window) = warp_renderer()?;
+    assert!(lazy.resources.as_ref().unwrap().path_scratch.is_none());
+
+    // Allocate with the original factories before drawing, as create_resources did.
+    let device = &eager.devices.as_ref().unwrap().device;
+    let (texture, srv) = create_path_intermediate_texture(device, eager.width, eager.height)?;
+    let (msaa_texture, msaa_view) =
+        create_path_intermediate_msaa_texture_and_view(device, eager.width, eager.height)?;
+    eager.resources.as_mut().unwrap().path_scratch = Some(PathScratch {
+        texture,
+        srv,
+        msaa_texture,
+        msaa_view,
+        width: eager.width,
+        height: eager.height,
+    });
+
+    let scene = path_scene();
+    for appearance in [
+        WindowBackgroundAppearance::Opaque,
+        WindowBackgroundAppearance::Transparent,
+    ] {
+        eager.draw_scene(&scene, appearance)?;
+        lazy.draw_scene(&scene, appearance)?;
+        let expected = pixels(&eager)?;
+        let actual = pixels(&lazy)?;
+        assert_eq!(actual, expected);
+        assert_ne!(actual[20 * 64 + 30], actual[60 * 64 + 4]);
+    }
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
+fn warp_path_scratch_cache_lifecycle() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    let empty = Scene::default();
+    let scene = path_scene();
+    renderer.draw_scene(&empty, WindowBackgroundAppearance::Transparent)?;
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_none());
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    let expected = pixels(&renderer)?;
+    let scratch = renderer.resources.as_ref().unwrap().path_scratch.as_ref().unwrap();
+    let texture = scratch.texture.clone();
+    let msaa_texture = scratch.msaa_texture.clone();
+    assert_eq!((scratch.width, scratch.height), (64, 64));
+
+    for _ in 0..SCRATCH_RELEASE_AFTER_FRAMES - 1 {
+        renderer.draw_scene(&empty, WindowBackgroundAppearance::Transparent)?;
+    }
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_some());
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    assert_eq!(renderer.path_free_frames, 0);
+    let scratch = renderer.resources.as_ref().unwrap().path_scratch.as_ref().unwrap();
+    assert_eq!(scratch.texture, texture, "path frames reuse the resolve texture");
+    assert_eq!(scratch.msaa_texture, msaa_texture, "path frames reuse MSAA scratch");
+    drop(texture);
+    drop(msaa_texture);
+    assert_eq!(pixels(&renderer)?, expected);
+
+    for _ in 0..SCRATCH_RELEASE_AFTER_FRAMES - 1 {
+        renderer.draw_scene(&empty, WindowBackgroundAppearance::Transparent)?;
+    }
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_some());
+    renderer.draw_scene(&empty, WindowBackgroundAppearance::Transparent)?;
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_none());
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    assert_eq!(pixels(&renderer)?, expected);
+
+    renderer.resize(size(DevicePixels(81), DevicePixels(73)))?;
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_none());
+    renderer.draw_scene(&empty, WindowBackgroundAppearance::Transparent)?;
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_none());
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    let scratch = renderer.resources.as_ref().unwrap().path_scratch.as_ref().unwrap();
+    assert_eq!((scratch.width, scratch.height), (81, 73));
+    renderer.resize(size(DevicePixels(64), DevicePixels(64)))?;
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_none());
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    assert_eq!(pixels(&renderer)?, expected);
+
+    // SIZE_MINIMIZED releases scratch without changing the drawable size.
+    renderer.release_path_scratch();
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_none());
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    assert_eq!(pixels(&renderer)?, expected);
+
+    renderer.handle_device_lost(&warp_devices()?)?;
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_none());
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_none());
+    renderer.mark_drawable();
+    renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
+    assert_eq!(pixels(&renderer)?, expected);
+    Ok(())
+}

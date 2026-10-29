@@ -27,6 +27,7 @@ pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSI
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
+const SCRATCH_RELEASE_AFTER_FRAMES: u32 = 30;
 
 mod backdrop;
 use backdrop::BackdropResources;
@@ -53,6 +54,7 @@ pub(crate) struct DirectXRenderer {
 
     width: u32,
     height: u32,
+    path_free_frames: u32,
 
     /// Whether we want to skip drwaing due to device lost events.
     ///
@@ -81,13 +83,19 @@ struct DirectXResources {
     render_target_view: Option<ID3D11RenderTargetView>,
 
     // Path intermediate textures (with MSAA)
-    path_intermediate_texture: ID3D11Texture2D,
-    path_intermediate_srv: Option<ID3D11ShaderResourceView>,
-    path_intermediate_msaa_texture: ID3D11Texture2D,
-    path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
+    path_scratch: Option<PathScratch>,
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
+}
+
+struct PathScratch {
+    texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
+    msaa_texture: ID3D11Texture2D,
+    msaa_view: Option<ID3D11RenderTargetView>,
+    width: u32,
+    height: u32,
 }
 
 struct DirectXRenderPipelines {
@@ -199,6 +207,7 @@ impl DirectXRenderer {
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
+            path_free_frames: 0,
             skip_draws: false,
         })
     }
@@ -323,6 +332,7 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
+        self.path_free_frames = 0;
         self.skip_draws = true;
         Ok(())
     }
@@ -356,6 +366,18 @@ impl DirectXRenderer {
         })?;
 
         self.upload_scene_buffers(scene)?;
+
+        if scene.paths.is_empty() {
+            self.path_free_frames = self.path_free_frames.saturating_add(1);
+            if self.path_free_frames >= SCRATCH_RELEASE_AFTER_FRAMES {
+                self.resources
+                    .as_mut()
+                    .context("resources missing")?
+                    .path_scratch = None;
+            }
+        } else {
+            self.path_free_frames = 0;
+        }
 
         {
             // Age unused resources even if the scene contains only clipped or
@@ -443,6 +465,8 @@ impl DirectXRenderer {
         unsafe { devices.device_context.OMSetRenderTargets(None, None) };
         let resources = self.resources.as_mut().context("resources missing")?;
         resources.backdrop = None;
+        resources.path_scratch = None;
+        self.path_free_frames = 0;
         resources.render_target.take();
         resources.render_target_view.take();
 
@@ -471,6 +495,43 @@ impl DirectXRenderer {
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn release_path_scratch(&mut self) {
+        if let Some(resources) = self.resources.as_mut() {
+            resources.path_scratch = None;
+        }
+        self.path_free_frames = 0;
+    }
+
+    fn ensure_path_scratch(&mut self) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        if resources
+            .path_scratch
+            .as_ref()
+            .is_some_and(|scratch| scratch.width == self.width && scratch.height == self.height)
+        {
+            return Ok(());
+        }
+
+        resources.path_scratch = None;
+        let (texture, srv) =
+            create_path_intermediate_texture(&devices.device, self.width, self.height)?;
+        let (msaa_texture, msaa_view) = create_path_intermediate_msaa_texture_and_view(
+            &devices.device,
+            self.width,
+            self.height,
+        )?;
+        resources.path_scratch = Some(PathScratch {
+            texture,
+            srv,
+            msaa_texture,
+            msaa_view,
+            width: self.width,
+            height: self.height,
+        });
         Ok(())
     }
 
@@ -576,18 +637,20 @@ impl DirectXRenderer {
         if paths.is_empty() {
             return Ok(());
         }
+        self.ensure_path_scratch()?;
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
+        let scratch = resources.path_scratch.as_ref().expect("path scratch missing");
         // Clear intermediate MSAA texture
         unsafe {
             devices.device_context.ClearRenderTargetView(
-                resources.path_intermediate_msaa_view.as_ref().unwrap(),
+                scratch.msaa_view.as_ref().unwrap(),
                 &[0.0; 4],
             );
             // Set intermediate MSAA texture as render target
             devices.device_context.OMSetRenderTargets(
-                Some(slice::from_ref(&resources.path_intermediate_msaa_view)),
+                Some(slice::from_ref(&scratch.msaa_view)),
                 None,
             );
         }
@@ -622,9 +685,9 @@ impl DirectXRenderer {
         // Resolve MSAA to non-MSAA intermediate texture
         unsafe {
             devices.device_context.ResolveSubresource(
-                &resources.path_intermediate_texture,
+                &scratch.texture,
                 0,
-                &resources.path_intermediate_msaa_texture,
+                &scratch.msaa_texture,
                 0,
                 RENDER_TARGET_FORMAT,
             );
@@ -666,6 +729,8 @@ impl DirectXRenderer {
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
+        debug_assert!(resources.path_scratch.is_some());
+        let scratch = resources.path_scratch.as_ref().expect("path scratch missing");
         self.pipelines.path_sprite_pipeline.update_buffer(
             &devices.device,
             &devices.device_context,
@@ -675,12 +740,18 @@ impl DirectXRenderer {
         // Draw the sprites with the path texture
         self.pipelines.path_sprite_pipeline.draw_with_texture(
             &devices.device_context,
-            slice::from_ref(&resources.path_intermediate_srv),
+            slice::from_ref(&scratch.srv),
             slice::from_ref(&resources.viewport),
             slice::from_ref(&self.globals.global_params_buffer),
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
-        )
+        )?;
+        // The context retains bound views, which would keep released scratch alive.
+        unsafe {
+            devices.device_context.VSSetShaderResources(0, Some(&[None]));
+            devices.device_context.PSSetShaderResources(0, Some(&[None]));
+        }
+        Ok(())
     }
 
     fn draw_underlines(&mut self, start: usize, len: usize) -> Result<()> {
@@ -848,15 +919,8 @@ impl DirectXResources {
             )?
         };
 
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &swap_chain, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
@@ -864,10 +928,7 @@ impl DirectXResources {
             swap_chain,
             render_target: Some(render_target),
             render_target_view,
-            path_intermediate_texture,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            path_intermediate_srv,
+            path_scratch: None,
             viewport,
         })
     }
@@ -879,21 +940,10 @@ impl DirectXResources {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &self.swap_chain, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &self.swap_chain, width, height)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
-        self.path_intermediate_texture = path_intermediate_texture;
-        self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
-        self.path_intermediate_msaa_view = path_intermediate_msaa_view;
-        self.path_intermediate_srv = path_intermediate_srv;
         self.viewport = viewport;
         Ok(())
     }
@@ -1318,28 +1368,12 @@ fn create_resources(
 ) -> Result<(
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
-    ID3D11Texture2D,
-    Option<ID3D11ShaderResourceView>,
-    ID3D11Texture2D,
-    Option<ID3D11RenderTargetView>,
     D3D11_VIEWPORT,
 )> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device)?;
-    let (path_intermediate_texture, path_intermediate_srv) =
-        create_path_intermediate_texture(&devices.device, width, height)?;
-    let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
-        create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
     let viewport = set_viewport(&devices.device_context, width as f32, height as f32);
-    Ok((
-        render_target,
-        render_target_view,
-        path_intermediate_texture,
-        path_intermediate_srv,
-        path_intermediate_msaa_texture,
-        path_intermediate_msaa_view,
-        viewport,
-    ))
+    Ok((render_target, render_target_view, viewport))
 }
 
 #[inline]
