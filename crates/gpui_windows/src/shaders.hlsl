@@ -991,6 +991,11 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
 **
 */
 
+cbuffer PathOrigin: register(b2) {
+    float2 path_origin;
+    float2 path_tex_size;
+};
+
 struct PathRasterizationSprite {
     float2 xy_position;
     float2 st_position;
@@ -1046,7 +1051,7 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
     GradientColor gradient = prepare_gradient_color(
         background.tag, background.color_space, background.solid, background.colors);
 
-    float4 color = gradient_color(background, input.position.xy, bounds,
+    float4 color = gradient_color(background, input.position.xy + path_origin, bounds,
         gradient.solid, gradient.color0, gradient.color1);
     return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
@@ -1063,7 +1068,6 @@ struct PathSprite {
 
 struct PathSpriteVertexOutput {
     float4 position: SV_Position;
-    float2 texture_coords: TEXCOORD0;
 };
 
 StructuredBuffer<PathSprite> path_sprites: register(t1);
@@ -1075,17 +1079,13 @@ PathSpriteVertexOutput path_sprite_vertex(uint vertex_id: SV_VertexID, uint spri
     // Don't apply content mask because it was already accounted for when rasterizing the path
     float4 device_position = to_device_position(unit_vertex, sprite.bounds);
 
-    float2 screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    float2 texture_coords = screen_position / global_viewport_size;
-
     PathSpriteVertexOutput output;
     output.position = device_position;
-    output.texture_coords = texture_coords;
     return output;
 }
 
 float4 path_sprite_fragment(PathSpriteVertexOutput input): SV_Target {
-    return t_sprite.Sample(s_sprite, input.texture_coords);
+    return t_sprite.Load(int3(int2(input.position.xy) - int2(path_origin), 0));
 }
 
 /*

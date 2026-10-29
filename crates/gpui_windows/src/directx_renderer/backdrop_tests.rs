@@ -5,7 +5,7 @@ use windows::{
     core::w,
 };
 
-struct TestWindow(HWND);
+pub(super) struct TestWindow(HWND);
 
 impl Drop for TestWindow {
     fn drop(&mut self) {
@@ -55,7 +55,7 @@ fn warp_devices() -> Result<DirectXDevices> {
     }
 }
 
-fn warp_renderer() -> Result<(DirectXRenderer, TestWindow)> {
+pub(super) fn warp_renderer() -> Result<(DirectXRenderer, TestWindow)> {
     unsafe {
         let devices = warp_devices()?;
         // A hidden built-in window class avoids a message loop and custom WndProc.
@@ -79,14 +79,14 @@ fn warp_renderer() -> Result<(DirectXRenderer, TestWindow)> {
     }
 }
 
-fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+pub(super) fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
     Bounds::new(
         point(ScaledPixels(x), ScaledPixels(y)),
         size(ScaledPixels(width), ScaledPixels(height)),
     )
 }
 
-fn quad(order: u32, rect: Bounds<ScaledPixels>, color: Hsla) -> Quad {
+pub(super) fn quad(order: u32, rect: Bounds<ScaledPixels>, color: Hsla) -> Quad {
     Quad {
         order,
         bounds: rect,
@@ -110,7 +110,7 @@ fn blur(order: u32) -> BackdropBlur {
     }
 }
 
-fn pixels(renderer: &DirectXRenderer) -> Result<Vec<[u8; 4]>> {
+pub(super) fn pixels(renderer: &DirectXRenderer) -> Result<Vec<[u8; 4]>> {
     let devices = renderer.devices.as_ref().unwrap();
     let target = renderer
         .resources
@@ -1041,19 +1041,12 @@ fn warp_lazy_path_scratch_matches_eager_resources() -> Result<()> {
     let (mut eager, _eager_window) = warp_renderer()?;
     assert!(lazy.resources.as_ref().unwrap().path_scratch.is_none());
 
-    // Allocate with the original factories before drawing, as create_resources did.
-    let device = &eager.devices.as_ref().unwrap().device;
-    let (texture, srv) = create_path_intermediate_texture(device, eager.width, eager.height)?;
-    let (msaa_texture, msaa_view) =
-        create_path_intermediate_msaa_texture_and_view(device, eager.width, eager.height)?;
-    eager.resources.as_mut().unwrap().path_scratch = Some(PathScratch {
-        texture,
-        srv,
-        msaa_texture,
-        msaa_view,
-        width: eager.width,
-        height: eager.height,
-    });
+    // Allocate full-window capacity up front, as create_resources used to do.
+    eager.resources.as_mut().unwrap().path_scratch = Some(PathScratch::new(
+        &eager.devices.as_ref().unwrap().device,
+        eager.width,
+        eager.height,
+    )?);
 
     let scene = path_scene();
     for appearance in [
@@ -1082,7 +1075,7 @@ fn warp_path_scratch_cache_lifecycle() -> Result<()> {
     let scratch = renderer.resources.as_ref().unwrap().path_scratch.as_ref().unwrap();
     let texture = scratch.texture.clone();
     let msaa_texture = scratch.msaa_texture.clone();
-    assert_eq!((scratch.width, scratch.height), (64, 64));
+    assert_eq!((scratch.cap_w, scratch.cap_h), (64, 64));
 
     for _ in 0..SCRATCH_RELEASE_AFTER_FRAMES - 1 {
         renderer.draw_scene(&empty, WindowBackgroundAppearance::Transparent)?;
@@ -1107,14 +1100,14 @@ fn warp_path_scratch_cache_lifecycle() -> Result<()> {
     assert_eq!(pixels(&renderer)?, expected);
 
     renderer.resize(size(DevicePixels(81), DevicePixels(73)))?;
-    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_none());
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_some());
     renderer.draw_scene(&empty, WindowBackgroundAppearance::Transparent)?;
-    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_none());
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_some());
     renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
     let scratch = renderer.resources.as_ref().unwrap().path_scratch.as_ref().unwrap();
-    assert_eq!((scratch.width, scratch.height), (81, 73));
+    assert_eq!((scratch.cap_w, scratch.cap_h), (64, 64));
     renderer.resize(size(DevicePixels(64), DevicePixels(64)))?;
-    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_none());
+    assert!(renderer.resources.as_ref().unwrap().path_scratch.is_some());
     renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
     assert_eq!(pixels(&renderer)?, expected);
 
