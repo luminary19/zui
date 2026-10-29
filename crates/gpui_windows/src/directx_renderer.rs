@@ -28,6 +28,7 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const SCRATCH_RELEASE_AFTER_FRAMES: u32 = 30;
+const INSTANCE_BUFFER_SHRINK_AFTER_FRAMES: u32 = 120;
 
 mod backdrop;
 use backdrop::BackdropResources;
@@ -478,7 +479,18 @@ impl DirectXRenderer {
         for blur in blurs {
             self.draw_backdrop_blur(blur)?;
         }
-        self.finish_path_frame(path_need)
+        self.finish_path_frame(path_need)?;
+
+        let device = &self.devices.as_ref().context("devices missing")?.device;
+        self.pipelines.shadow_pipeline.end_frame(device)?;
+        self.pipelines.quad_pipeline.end_frame(device)?;
+        self.pipelines.path_rasterization_pipeline.end_frame(device)?;
+        self.pipelines.path_sprite_pipeline.end_frame(device)?;
+        self.pipelines.underline_pipeline.end_frame(device)?;
+        self.pipelines.mono_sprites.end_frame(device)?;
+        self.pipelines.subpixel_sprites.end_frame(device)?;
+        self.pipelines.poly_sprites.end_frame(device)?;
+        Ok(())
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -1234,6 +1246,9 @@ struct PipelineState<T> {
     fragment: ID3D11PixelShader,
     buffer: ID3D11Buffer,
     buffer_size: usize,
+    initial_size: usize,
+    peak_this_frame: usize,
+    low_usage_frames: u32,
     view: Option<ID3D11ShaderResourceView>,
     blend_state: ID3D11BlendState,
     _marker: std::marker::PhantomData<T>,
@@ -1264,6 +1279,9 @@ impl<T> PipelineState<T> {
             fragment,
             buffer,
             buffer_size,
+            initial_size: buffer_size,
+            peak_this_frame: 0,
+            low_usage_frames: 0,
             view,
             blend_state,
             _marker: std::marker::PhantomData,
@@ -1276,6 +1294,7 @@ impl<T> PipelineState<T> {
         device_context: &ID3D11DeviceContext,
         data: &[T],
     ) -> Result<()> {
+        self.peak_this_frame = self.peak_this_frame.max(data.len());
         if self.buffer_size < data.len() {
             let new_buffer_size = data.len().next_power_of_two();
             log::debug!(
@@ -1291,6 +1310,31 @@ impl<T> PipelineState<T> {
             self.buffer_size = new_buffer_size;
         }
         update_buffer(device_context, &self.buffer, data)
+    }
+
+    fn end_frame(&mut self, device: &ID3D11Device) -> Result<()> {
+        let peak_this_frame = std::mem::take(&mut self.peak_this_frame);
+        if self.buffer_size > self.initial_size && peak_this_frame <= self.buffer_size / 2 {
+            self.low_usage_frames += 1;
+            if self.low_usage_frames >= INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
+                let new_buffer_size = (self.buffer_size / 2).max(self.initial_size);
+                log::debug!(
+                    "Updating {} buffer size from {} to {}",
+                    self.label,
+                    self.buffer_size,
+                    new_buffer_size
+                );
+                let buffer = create_buffer(device, std::mem::size_of::<T>(), new_buffer_size)?;
+                let view = create_buffer_view(device, &buffer)?;
+                self.buffer = buffer;
+                self.view = view;
+                self.buffer_size = new_buffer_size;
+                self.low_usage_frames = 0;
+            }
+        } else {
+            self.low_usage_frames = 0;
+        }
+        Ok(())
     }
 
     fn draw(
