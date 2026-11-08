@@ -72,20 +72,19 @@ impl DirectXDevices {
     }
 }
 
+/// Set to create the DXGI factory and D3D11 devices with the debug layers. Validation changes
+/// driver timing and slows every call, so it is a diagnostic to ask for, not a debug-build default.
+const D3D11_DEBUG_LAYER: &str = "GPUI_D3D11_DEBUG";
+
 #[inline]
 fn check_debug_layer_available() -> bool {
-    #[cfg(debug_assertions)]
-    {
-        use windows::Win32::Graphics::Dxgi::{DXGIGetDebugInterface1, IDXGIInfoQueue};
+    use windows::Win32::Graphics::Dxgi::{DXGIGetDebugInterface1, IDXGIInfoQueue};
 
-        unsafe { DXGIGetDebugInterface1::<IDXGIInfoQueue>(0) }
+    std::env::var_os(D3D11_DEBUG_LAYER).is_some()
+        && unsafe { DXGIGetDebugInterface1::<IDXGIInfoQueue>(0) }
+            .context("GPUI_D3D11_DEBUG is set, but the DirectX debug layers are not installed")
             .log_err()
             .is_some()
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        false
-    }
 }
 
 #[inline]
@@ -93,10 +92,6 @@ fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
     let factory_flag = if debug_layer_available {
         DXGI_CREATE_FACTORY_DEBUG
     } else {
-        #[cfg(debug_assertions)]
-        log::warn!(
-            "Failed to get DXGI debug interface. DirectX debugging features will be disabled."
-        );
         DXGI_CREATE_FACTORY_FLAGS::default()
     };
     unsafe { Ok(CreateDXGIFactory2(factory_flag)?) }
@@ -190,5 +185,21 @@ fn get_device(
         Err(anyhow::anyhow!(
             "Required feature StructuredBuffer is not supported by GPU/driver"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D11::ID3D11Debug;
+
+    #[test]
+    fn devices_skip_the_debug_layer_unless_requested() -> Result<()> {
+        if std::env::var_os(D3D11_DEBUG_LAYER).is_some() {
+            return Ok(());
+        }
+        let devices = DirectXDevices::new()?;
+        assert!(devices.device.cast::<ID3D11Debug>().is_err());
+        Ok(())
     }
 }

@@ -303,7 +303,6 @@ impl DirectXRenderer {
         self.skip_draws = true;
 
         unsafe {
-            #[cfg(debug_assertions)]
             if let Some(devices) = &self.devices {
                 report_live_objects(&devices.device)
                     .context("Failed to report live objects after device lost")
@@ -315,7 +314,6 @@ impl DirectXRenderer {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
                 devices.device_context.Flush();
-                #[cfg(debug_assertions)]
                 report_live_objects(&devices.device)
                     .context("Failed to report live objects after device lost")
                     .log_err();
@@ -1510,7 +1508,6 @@ struct PathSprite {
 
 impl Drop for DirectXRenderer {
     fn drop(&mut self) {
-        #[cfg(debug_assertions)]
         if let Some(devices) = &self.devices {
             report_live_objects(&devices.device).ok();
         }
@@ -1900,9 +1897,11 @@ fn set_pipeline_state(
     }
 }
 
-#[cfg(debug_assertions)]
 fn report_live_objects(device: &ID3D11Device) -> Result<()> {
-    let debug_device: ID3D11Debug = device.cast()?;
+    // Only a device created with the debug layer (`GPUI_D3D11_DEBUG`) can report.
+    let Ok(debug_device) = device.cast::<ID3D11Debug>() else {
+        return Ok(());
+    };
     unsafe {
         debug_device.ReportLiveDeviceObjects(D3D11_RLDO_DETAIL)?;
     }
