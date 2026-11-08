@@ -122,28 +122,59 @@ fn get_dwm_interval() -> Result<Duration> {
         ..Default::default()
     };
     unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut timing_info) }?;
-    let interval = retrieve_duration(timing_info.qpcRefreshPeriod, *QPC_TICKS_PER_SECOND);
     // Check for interval values that are impossibly low. A 29 microsecond
     // interval was seen (from a qpcRefreshPeriod of 60).
-    if interval < VSYNC_INTERVAL_THRESHOLD {
-        Ok(retrieve_duration(
-            timing_info.rateRefresh.uiDenominator as u64,
-            timing_info.rateRefresh.uiNumerator as u64,
-        ))
-    } else {
-        Ok(interval)
-    }
+    let plausible = |interval: &Duration| *interval >= VSYNC_INTERVAL_THRESHOLD;
+    retrieve_duration(timing_info.qpcRefreshPeriod, *QPC_TICKS_PER_SECOND)
+        .filter(plausible)
+        .or_else(|| {
+            retrieve_duration(
+                timing_info.rateRefresh.uiDenominator as u64,
+                timing_info.rateRefresh.uiNumerator as u64,
+            )
+            .filter(plausible)
+        })
+        .context("DWM reported no plausible refresh period")
 }
 
+/// The duration of `counts` ticks of a clock that ticks `ticks_per_second` times a second,
+/// or `None` for a zero rate.
 #[inline]
-fn retrieve_duration(counts: u64, ticks_per_second: u64) -> Duration {
-    let ticks_per_microsecond = ticks_per_second / 1_000_000;
-    Duration::from_micros(counts / ticks_per_microsecond)
+fn retrieve_duration(counts: u64, ticks_per_second: u64) -> Option<Duration> {
+    let nanos = (counts as u128 * 1_000_000_000).checked_div(ticks_per_second as u128)?;
+    Some(Duration::from_nanos(u64::try_from(nanos).ok()?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retrieve_duration_converts_qpc_ticks() {
+        // A 60 Hz refresh period on a 10 MHz performance counter.
+        assert_eq!(
+            retrieve_duration(166_667, 10_000_000),
+            Some(Duration::from_nanos(16_666_700))
+        );
+    }
+
+    #[test]
+    fn retrieve_duration_converts_refresh_rate_fractions() {
+        // The DWM fallback passes the refresh rate as denominator / numerator.
+        assert_eq!(
+            retrieve_duration(1, 60),
+            Some(Duration::from_nanos(16_666_666))
+        );
+        assert_eq!(
+            retrieve_duration(1001, 60_000),
+            Some(Duration::from_nanos(16_683_333))
+        );
+    }
+
+    #[test]
+    fn retrieve_duration_rejects_a_zero_rate() {
+        assert_eq!(retrieve_duration(1, 0), None);
+    }
 
     #[test]
     fn park_times_out_while_paused() {
