@@ -122,19 +122,29 @@ fn get_dwm_interval() -> Result<Duration> {
         ..Default::default()
     };
     unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut timing_info) }?;
+    refresh_period(
+        timing_info.qpcRefreshPeriod,
+        *QPC_TICKS_PER_SECOND,
+        timing_info.rateRefresh.uiNumerator as u64,
+        timing_info.rateRefresh.uiDenominator as u64,
+    )
+    .context("DWM reported no plausible refresh period")
+}
+
+/// The refresh period from the QPC tick count, or from the refresh rate when that count is
+/// implausible.
+fn refresh_period(
+    qpc_period: u64,
+    qpc_ticks_per_second: u64,
+    rate_numerator: u64,
+    rate_denominator: u64,
+) -> Option<Duration> {
     // Check for interval values that are impossibly low. A 29 microsecond
     // interval was seen (from a qpcRefreshPeriod of 60).
     let plausible = |interval: &Duration| *interval >= VSYNC_INTERVAL_THRESHOLD;
-    retrieve_duration(timing_info.qpcRefreshPeriod, *QPC_TICKS_PER_SECOND)
+    retrieve_duration(qpc_period, qpc_ticks_per_second)
         .filter(plausible)
-        .or_else(|| {
-            retrieve_duration(
-                timing_info.rateRefresh.uiDenominator as u64,
-                timing_info.rateRefresh.uiNumerator as u64,
-            )
-            .filter(plausible)
-        })
-        .context("DWM reported no plausible refresh period")
+        .or_else(|| retrieve_duration(rate_denominator, rate_numerator).filter(plausible))
 }
 
 /// The duration of `counts` ticks of a clock that ticks `ticks_per_second` times a second,
@@ -174,6 +184,29 @@ mod tests {
     #[test]
     fn retrieve_duration_rejects_a_zero_rate() {
         assert_eq!(retrieve_duration(1, 0), None);
+    }
+
+    #[test]
+    fn refresh_period_prefers_a_plausible_qpc_period() {
+        assert_eq!(
+            refresh_period(166_667, 10_000_000, 0, 0),
+            Some(Duration::from_nanos(16_666_700))
+        );
+    }
+
+    #[test]
+    fn refresh_period_falls_back_to_the_refresh_rate() {
+        // The implausible period seen in the wild, with a 60 Hz refresh rate.
+        assert_eq!(
+            refresh_period(60, 10_000_000, 60, 1),
+            Some(Duration::from_nanos(16_666_666))
+        );
+    }
+
+    #[test]
+    fn refresh_period_rejects_an_implausible_fallback() {
+        assert_eq!(refresh_period(60, 10_000_000, 1, 0), None);
+        assert_eq!(refresh_period(60, 10_000_000, 1_000_000, 1), None);
     }
 
     #[test]
