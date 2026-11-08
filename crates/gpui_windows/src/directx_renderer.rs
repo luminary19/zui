@@ -52,6 +52,9 @@ pub(crate) struct DirectXRenderer {
     resources: Option<DirectXResources>,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
+    /// Fixed at creation: the window's style was chosen for this presentation mode, so device
+    /// recovery must rebuild the same mode however many attempts it takes.
+    disable_direct_composition: bool,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
 
@@ -225,6 +228,7 @@ impl DirectXRenderer {
             resources: Some(resources),
             globals,
             pipelines,
+            disable_direct_composition,
             direct_composition,
             font_info: Self::get_font_info(),
             width: 1,
@@ -293,7 +297,7 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
-        let disable_direct_composition = self.direct_composition.is_none();
+        let disable_direct_composition = self.disable_direct_composition;
 
         unsafe {
             #[cfg(debug_assertions)]

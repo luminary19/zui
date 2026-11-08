@@ -60,9 +60,16 @@ pub(super) fn warp_renderer() -> Result<(DirectXRenderer, TestWindow)> {
 }
 
 fn warp_renderer_with_devices(devices: &DirectXDevices) -> Result<(DirectXRenderer, TestWindow)> {
+    let window = test_window()?;
+    let mut renderer = DirectXRenderer::new(window.0, devices, true)?;
+    renderer.resize(size(DevicePixels(64), DevicePixels(64)))?;
+    Ok((renderer, window))
+}
+
+fn test_window() -> Result<TestWindow> {
     unsafe {
         // A hidden built-in window class avoids a message loop and custom WndProc.
-        let window = TestWindow(CreateWindowExW(
+        Ok(TestWindow(CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("STATIC"),
             w!("GPUI WARP regression"),
@@ -75,10 +82,7 @@ fn warp_renderer_with_devices(devices: &DirectXDevices) -> Result<(DirectXRender
             None,
             None,
             None,
-        )?);
-        let mut renderer = DirectXRenderer::new(window.0, devices, true)?;
-        renderer.resize(size(DevicePixels(64), DevicePixels(64)))?;
-        Ok((renderer, window))
+        )?))
     }
 }
 
@@ -1292,5 +1296,22 @@ fn warp_path_scratch_cache_lifecycle() -> Result<()> {
     renderer.mark_drawable();
     renderer.draw_scene(&scene, WindowBackgroundAppearance::Transparent)?;
     assert_eq!(pixels(&renderer)?, expected);
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
+fn warp_recovery_keeps_direct_composition_after_a_failed_attempt() -> Result<()> {
+    let window = test_window()?;
+    let mut renderer = DirectXRenderer::new(window.0, &warp_devices()?, false)?;
+    assert!(renderer.direct_composition.is_some());
+
+    // A failed recovery attempt has already released the composition before its fallible
+    // rebuild, so the next attempt starts from exactly this state.
+    renderer.direct_composition = None;
+    renderer.handle_device_lost(&warp_devices()?)?;
+    assert!(
+        renderer.direct_composition.is_some(),
+        "recovery must rebuild the presentation mode the window was created for"
+    );
     Ok(())
 }
