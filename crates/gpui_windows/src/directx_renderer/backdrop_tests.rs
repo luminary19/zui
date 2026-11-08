@@ -1315,3 +1315,24 @@ fn warp_recovery_keeps_direct_composition_after_a_failed_attempt() -> Result<()>
     );
     Ok(())
 }
+
+#[::core::prelude::v1::test]
+fn warp_failed_recovery_leaves_the_renderer_undrawable() -> Result<()> {
+    let (mut renderer, window) = warp_renderer()?;
+    // Without its window the swap chain cannot be rebuilt, so every attempt fails after
+    // releasing the old resources.
+    unsafe { DestroyWindow(window.0)? };
+    std::mem::forget(window);
+    assert!(renderer.handle_device_lost(&warp_devices()?).is_err());
+
+    // A forced redraw must not draw with the released resources, and a resize reports the
+    // failure so the platform retries recovery.
+    renderer.mark_drawable();
+    renderer.draw(&path_scene(), WindowBackgroundAppearance::Opaque)?;
+    assert!(
+        renderer
+            .resize(size(DevicePixels(80), DevicePixels(80)))
+            .is_err()
+    );
+    Ok(())
+}

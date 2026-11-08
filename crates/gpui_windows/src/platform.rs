@@ -339,17 +339,24 @@ impl WindowsPlatform {
                     });
                     drop(windows);
                     vsync_provider.wait_for_vsync();
-                    if check_device_lost(&directx_device.device)
-                        || invalidate_devices.fetch_and(false, Ordering::Acquire)
-                    {
-                        if let Err(err) = handle_gpu_device_lost(
+                    // Consume a pending invalidation even when the device is lost, so one
+                    // recovery answers both.
+                    let invalidated = invalidate_devices.swap(false, Ordering::AcqRel);
+                    if check_device_lost(&directx_device.device) || invalidated {
+                        // A failed recovery leaves the devices lost: try again next tick
+                        // instead of ending the thread that paces every window.
+                        if handle_gpu_device_lost(
                             &mut directx_device,
                             platform_window.as_raw(),
                             validation_number,
                             &all_windows,
                             &text_system,
-                        ) {
-                            panic!("Device lost: {err}");
+                        )
+                        .context("Recovering from a lost GPU device")
+                        .log_err()
+                        .is_none()
+                        {
+                            invalidate_devices.store(true, Ordering::Release);
                         }
                     }
                     let Some(all_windows) = all_windows.upgrade() else {
@@ -1419,28 +1426,40 @@ fn handle_gpu_device_lost(
     if let Some(text_system) = text_system.upgrade() {
         text_system.handle_gpu_lost(&directx_devices)?;
     }
-    if let Some(all_windows) = all_windows.upgrade() {
-        for window in all_windows.read().iter() {
-            unsafe {
+    // Send to a snapshot: the main thread takes the write lock to close a window, so holding
+    // the read lock across a cross-thread SendMessageW can deadlock.
+    let windows: SmallVec<[HWND; 4]> = all_windows.upgrade().map_or_else(SmallVec::new, |all| {
+        all.read().iter().map(RegisteredWindow::as_raw).collect()
+    });
+    let failed_windows = windows
+        .iter()
+        .filter(|window| {
+            let result = unsafe {
                 SendMessageW(
-                    window.as_raw(),
+                    **window,
                     WM_GPUI_GPU_DEVICE_LOST,
                     Some(WPARAM(validation_number)),
                     Some(lparam),
-                );
-            }
+                )
+            };
+            result.0 == GPU_DEVICE_LOST_RECOVERY_FAILED
+        })
+        .count();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    for window in &windows {
+        unsafe {
+            SendMessageW(
+                *window,
+                WM_GPUI_FORCE_UPDATE_WINDOW,
+                Some(WPARAM(validation_number)),
+                None,
+            );
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        for window in all_windows.read().iter() {
-            unsafe {
-                SendMessageW(
-                    window.as_raw(),
-                    WM_GPUI_FORCE_UPDATE_WINDOW,
-                    Some(WPARAM(validation_number)),
-                    None,
-                );
-            }
-        }
+    }
+    if failed_windows > 0 {
+        return Err(anyhow!(
+            "{failed_windows} window(s) could not rebuild their renderer"
+        ));
     }
     Ok(())
 }
