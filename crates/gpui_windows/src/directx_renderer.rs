@@ -294,6 +294,9 @@ impl DirectXRenderer {
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
         let disable_direct_composition = self.direct_composition.is_none();
+        // Nothing can be drawn from here until an attempt succeeds, even if this one fails
+        // after releasing the old resources.
+        self.skip_draws = true;
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -1008,7 +1011,8 @@ impl DirectXRenderer {
     }
 
     pub(crate) fn mark_drawable(&mut self) {
-        self.skip_draws = false;
+        // After a failed device-loss recovery there is nothing to draw with until a retry succeeds.
+        self.skip_draws = self.resources.is_none();
     }
 }
 
