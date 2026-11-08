@@ -344,7 +344,11 @@ impl WindowsPlatform {
                     // Consume a pending invalidation even when the device is lost, so one
                     // recovery answers both.
                     let invalidated = invalidate_devices.swap(false, Ordering::AcqRel);
-                    if check_device_lost(&directx_device.device) || invalidated {
+                    // While a recovery is pending the loss is already known; checking again
+                    // would only log it every frame until the retry is due.
+                    if invalidated
+                        || (!recovery.is_pending() && check_device_lost(&directx_device.device))
+                    {
                         recovery.request();
                     }
                     // A failed recovery stays pending and is retried with backoff instead of

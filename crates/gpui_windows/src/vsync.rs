@@ -134,6 +134,10 @@ impl DeviceRecoveryRetry {
         self.pending = true;
     }
 
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending
+    }
+
     pub(crate) fn is_due(&self, now: Instant) -> bool {
         self.pending && self.next_attempt.is_none_or(|next| now >= next)
     }
@@ -264,10 +268,15 @@ mod tests {
         for expected in [1, 2, 4, 8, 16, 30, 30] {
             assert!(recovery.is_due(now));
             recovery.finish(false, now);
-            // Still pending, and a new device loss does not skip the wait.
-            recovery.request();
             let delay = Duration::from_secs(expected);
-            assert!(!recovery.is_due(now + delay - Duration::from_millis(1)));
+            let just_before = now + delay - Duration::from_millis(1);
+            // A failed recovery stays pending on its own and is retried after the delay.
+            assert!(recovery.is_pending());
+            assert!(!recovery.is_due(just_before));
+            assert!(recovery.is_due(now + delay));
+            // A new device loss does not skip the wait.
+            recovery.request();
+            assert!(!recovery.is_due(just_before));
             now += delay;
         }
         assert!(recovery.is_due(now));
