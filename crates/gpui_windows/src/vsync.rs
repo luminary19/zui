@@ -27,6 +27,9 @@ const VSYNC_INTERVAL_THRESHOLD: Duration = Duration::from_millis(1);
 const DEFAULT_VSYNC_INTERVAL: Duration = Duration::from_micros(16_666); // ~60Hz
 /// How often a parked `VSyncProvider` thread still wakes to check for GPU device loss.
 pub(crate) const PARKED_DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Waits between failed GPU device-loss recoveries: doubled after each failure, up to the max.
+const MIN_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 pub(crate) struct VSyncProvider {
     interval: Duration,
@@ -113,6 +116,38 @@ impl FrameDemand {
 
     pub(crate) fn is_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
+    }
+}
+
+/// Paces GPU device-loss recovery on the `VSyncProvider` thread. A requested recovery runs at
+/// once; one that fails stays pending and is retried with a growing delay, so a recovery that
+/// keeps failing neither stops the thread nor rebuilds every window on every tick.
+#[derive(Default)]
+pub(crate) struct DeviceRecoveryRetry {
+    pending: bool,
+    failures: u32,
+    next_attempt: Option<Instant>,
+}
+
+impl DeviceRecoveryRetry {
+    pub(crate) fn request(&mut self) {
+        self.pending = true;
+    }
+
+    pub(crate) fn is_due(&self, now: Instant) -> bool {
+        self.pending && self.next_attempt.is_none_or(|next| now >= next)
+    }
+
+    pub(crate) fn finish(&mut self, recovered: bool, now: Instant) {
+        if recovered {
+            *self = Self::default();
+            return;
+        }
+        let delay = MIN_RECOVERY_RETRY_DELAY
+            .saturating_mul(1 << self.failures.min(5))
+            .min(MAX_RECOVERY_RETRY_DELAY);
+        self.failures += 1;
+        self.next_attempt = Some(now + delay);
     }
 }
 
@@ -207,6 +242,37 @@ mod tests {
     fn refresh_period_rejects_an_implausible_fallback() {
         assert_eq!(refresh_period(60, 10_000_000, 1, 0), None);
         assert_eq!(refresh_period(60, 10_000_000, 1_000_000, 1), None);
+    }
+
+    #[test]
+    fn recovery_runs_once_requested() {
+        let now = Instant::now();
+        let mut recovery = DeviceRecoveryRetry::default();
+        assert!(!recovery.is_due(now));
+        recovery.request();
+        assert!(recovery.is_due(now));
+        recovery.finish(true, now);
+        assert!(!recovery.is_due(now + MAX_RECOVERY_RETRY_DELAY));
+    }
+
+    #[test]
+    fn failed_recovery_is_retried_with_a_growing_capped_delay() {
+        let mut now = Instant::now();
+        let mut recovery = DeviceRecoveryRetry::default();
+        recovery.request();
+        for expected in [1, 2, 4, 8, 16, 30, 30] {
+            assert!(recovery.is_due(now));
+            recovery.finish(false, now);
+            // Still pending, and a new device loss does not skip the wait.
+            recovery.request();
+            let delay = Duration::from_secs(expected);
+            assert!(!recovery.is_due(now + delay - Duration::from_millis(1)));
+            now += delay;
+        }
+        assert!(recovery.is_due(now));
+        recovery.finish(true, now);
+        recovery.request();
+        assert!(recovery.is_due(now), "a success resets the backoff");
     }
 
     #[test]

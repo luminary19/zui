@@ -7,6 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -325,6 +326,7 @@ impl WindowsPlatform {
             .name("VSyncProvider".to_owned())
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
+                let mut recovery = DeviceRecoveryRetry::default();
                 loop {
                     let Some(windows) = all_windows.upgrade() else {
                         break;
@@ -343,9 +345,12 @@ impl WindowsPlatform {
                     // recovery answers both.
                     let invalidated = invalidate_devices.swap(false, Ordering::AcqRel);
                     if check_device_lost(&directx_device.device) || invalidated {
-                        // A failed recovery leaves the devices lost: try again next tick
-                        // instead of ending the thread that paces every window.
-                        if handle_gpu_device_lost(
+                        recovery.request();
+                    }
+                    // A failed recovery stays pending and is retried with backoff instead of
+                    // ending the thread that paces every window.
+                    if recovery.is_due(Instant::now()) {
+                        let recovered = handle_gpu_device_lost(
                             &mut directx_device,
                             platform_window.as_raw(),
                             validation_number,
@@ -354,10 +359,8 @@ impl WindowsPlatform {
                         )
                         .context("Recovering from a lost GPU device")
                         .log_err()
-                        .is_none()
-                        {
-                            invalidate_devices.store(true, Ordering::Release);
-                        }
+                        .is_some();
+                        recovery.finish(recovered, Instant::now());
                     }
                     let Some(all_windows) = all_windows.upgrade() else {
                         break;
