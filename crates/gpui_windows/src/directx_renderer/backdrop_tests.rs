@@ -1304,8 +1304,9 @@ fn warp_failed_recovery_leaves_the_renderer_undrawable() -> Result<()> {
     std::mem::forget(window);
     assert!(renderer.handle_device_lost(&warp_devices()?).is_err());
 
-    // A forced redraw must not draw with the released resources, and a resize reports the
-    // failure so the platform retries recovery.
+    // Neither a regular nor a forced redraw may draw with the released resources, and a
+    // resize reports the failure so the platform retries recovery.
+    renderer.draw(&path_scene(), WindowBackgroundAppearance::Opaque)?;
     renderer.mark_drawable();
     renderer.draw(&path_scene(), WindowBackgroundAppearance::Opaque)?;
     assert!(
