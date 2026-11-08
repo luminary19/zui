@@ -188,8 +188,9 @@ mod tests {
 
     #[test]
     fn refresh_period_prefers_a_plausible_qpc_period() {
+        // The refresh rate alone would give 16_666_666 ns.
         assert_eq!(
-            refresh_period(166_667, 10_000_000, 0, 0),
+            refresh_period(166_667, 10_000_000, 60, 1),
             Some(Duration::from_nanos(16_666_700))
         );
     }
