@@ -29,6 +29,9 @@ pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
 pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 
+/// What a window answers to `WM_GPUI_GPU_DEVICE_LOST` when it could not rebuild its renderer.
+pub(crate) const GPU_DEVICE_LOST_RECOVERY_FAILED: isize = 1;
+
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 pub(crate) const IDLE_RESOURCE_RELEASE_TIMER_ID: usize = 2;
 
@@ -1207,13 +1210,16 @@ impl WindowsWindowInner {
     fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
         let devices = lparam.0 as *const DirectXDevices;
         let devices = unsafe { &*devices };
-        if let Err(err) = self
+        // The renderer stays undrawable until a later attempt succeeds; the platform retries.
+        if self
             .state
             .renderer
             .borrow_mut()
             .handle_device_lost(&devices)
+            .log_err()
+            .is_none()
         {
-            panic!("Device lost: {err}");
+            return Some(GPU_DEVICE_LOST_RECOVERY_FAILED);
         }
         // Make sure the first `draw_window` after recovery (whether it comes
         // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in
