@@ -72,17 +72,25 @@ impl DirectXDevices {
     }
 }
 
-/// Set to create the DXGI factory and D3D11 devices with the debug layers. Validation changes
-/// driver timing and slows every call, so it is a diagnostic to ask for, not a debug-build default.
+/// Set to `true` or `1` to create the DXGI factory and D3D11 devices with the debug layers.
+/// Validation changes driver timing and slows every call, so it is a diagnostic to ask for,
+/// not a debug-build default.
 const D3D11_DEBUG_LAYER: &str = "GPUI_D3D11_DEBUG";
+
+fn debug_layer_requested() -> bool {
+    std::env::var(D3D11_DEBUG_LAYER).is_ok_and(|value| value == "true" || value == "1")
+}
 
 #[inline]
 fn check_debug_layer_available() -> bool {
     use windows::Win32::Graphics::Dxgi::{DXGIGetDebugInterface1, IDXGIInfoQueue};
 
-    std::env::var_os(D3D11_DEBUG_LAYER).is_some()
+    debug_layer_requested()
         && unsafe { DXGIGetDebugInterface1::<IDXGIInfoQueue>(0) }
-            .context("GPUI_D3D11_DEBUG is set, but the DirectX debug layers are not installed")
+            .context(
+                "GPUI_D3D11_DEBUG is set, but the DirectX debug layers are missing: \
+                 install the Windows \"Graphics Tools\" optional feature",
+            )
             .log_err()
             .is_some()
 }
@@ -195,7 +203,7 @@ mod tests {
 
     #[test]
     fn devices_skip_the_debug_layer_unless_requested() -> Result<()> {
-        if std::env::var_os(D3D11_DEBUG_LAYER).is_some() {
+        if debug_layer_requested() {
             return Ok(());
         }
         let devices = DirectXDevices::new()?;
